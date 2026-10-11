@@ -55,10 +55,16 @@ test('a big lazy file is served through an LRU set of windows and is never loade
   const fs = readFileSync(join(host, 'host_shims_fs.c'), 'utf8');
   assert.ok(fs.includes('#define FS_WIN (1u << 20)'), 'one window is 1 MB');
   assert.ok(fs.includes('#define FS_WIN_SLOTS 32') && fs.includes('uint8_t *win[FS_WIN_SLOTS];'), '32 windows per entry (round 41: a level load walks scattered resources; two slots thrashed 827 MB per run start)');
-  assert.ok(fs.includes('if (e->win_tick[k] < e->win_tick[oldest]) oldest = k;'), 'a miss evicts the least recently used window');
+  assert.ok(fs.includes('if (w->win_tick[k] < w->win_tick[oldest]) oldest = k;'), 'a miss evicts the least recently used window');
   assert.ok(fs.includes('void isaac_fs_window_stats(uint32_t *fills, uint32_t *hits)'), 'the fill/hit census');
-  assert.ok(/if \(e->size >= fs_window_min\(\) && fs_pread_avail\(\)\) \{\s*e->lazy = 0; e->windowed = 1;/.test(fs),
-    'materialise turns a large lazy entry into a windowed one when the driver can pread');
+  assert.ok(/if \(e->size >= fs_window_min\(\) && fs_pread_avail\(\) && wc < FS_WIN_FILES\) \{\s*memset\(&g_wc\[wc\], 0, sizeof g_wc\[wc\]\);\s*g_wc\[wc\]\.used = 1;\s*e->wc = \(uint8_t\)\(wc \+ 1u\);\s*e->lazy = 0; e->windowed = 1;/.test(fs),
+    'materialise turns a large lazy entry into a windowed one when the driver can pread (round 95: with its caches beside the table)');
+  assert.ok(fs.includes('#define FS_SLOTS      65536u') && fs.includes('#define FS_HASH 262144u'),
+    'round 95: 65,536 slots (a 9,403-file mod under both roots overflowed 16,384), the hash index 4x that');
+  assert.ok(/typedef struct \{\s*char\s+key\[160\];[^}]*uint8_t\s+wc;[^}]*\} fs_entry;/.test(fs) && !/\} fs_entry;/.test(fs.slice(0, fs.indexOf('uint8_t  wc;'))),
+    'round 95: a slot holds one byte for its window caches, not the caches');
+  assert.ok(fs.includes('for (unsigned i = 0; i < g_fs_high && cnt < FS_FIND_MAX; ++i) {') && fs.includes('if (i + 1u > g_fs_high) g_fs_high = i + 1u;'),
+    'round 95: a directory scan stops at the highest slot ever used');
   assert.ok(fs.includes('if (e->windowed) got = fs_window_read(e, pos, got, (uint8_t *)isaac_g(dst));'),
     'fread reads through the window');
   assert.ok(fs.includes('ISAAC_FS_WINDOW_MIN'), 'the threshold is tunable (MiB; 0 = never window)');

@@ -20,9 +20,18 @@
 // it, nothing trapped, and the run started. A baseline run with no mod at all
 // gives the frame rate the mods are compared against -- a mod that loads and
 // halves the frame rate has not "worked".
+//
+// Round 95: a mod whose catalogue entry `requires` others is tested with them:
+// they are imported first, in the order the page itself would install them
+// (requiredChain). strict=1 also fails a mod whose own files raise a Lua error
+// in the engine's log, which is what "works with Repentance+" has to mean for a
+// catalogue built from a player's workshop folder. shard=k/n runs every n-th mod
+// from the k-th, so n drivers can share a catalogue. Each run leaves the engine's
+// own log beside the console log (<id>.game.log).
 import { chromium } from 'playwright';
 import { mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { requiredChain } from './mods.mjs';
 
 const [URL, OUT, ...rest] = process.argv.slice(2);
 if (!URL || !OUT) {
@@ -33,6 +42,11 @@ const opt = Object.fromEntries(rest.map((a) => a.split('=')));
 const CAT = opt.catalogue || '.scratch/mod-catalogue';
 const SECONDS = Number(opt.seconds || 8);
 const ONLY = opt.only ? new Set(opt.only.split(',')) : null;
+const STRICT = opt.strict === '1';
+// round 95: a mod that hangs the page (Encyclopedia did) would hang the driver --
+// page.evaluate has no deadline of its own -- so each run gets one
+const MAX_MS = Number(opt.maxsec || 300) * 1000;
+const [SHARD_K, SHARD_N] = (opt.shard || '0/1').split('/').map(Number);
 // trace=1 boots with ISAAC_FS_TRACE=1 so the FS shim names every path it is
 // asked for. That is the evidence that a mod's own FILES are being read --
 // loading a mod and reading nothing out of it are not the same thing -- but it
@@ -46,7 +60,8 @@ const median = (a) => { const s = [...a].sort((x, y) => x - y); return s.length 
 
 // ---- the catalogue, as modpack.py wrote it: a zip split into <id>.<n>.bin
 const cat = JSON.parse(readFileSync(join(CAT, 'catalogue.json'), 'utf8'));
-const mods = (cat.mods || cat).filter((m) => !ONLY || ONLY.has(m.id));
+const allMods = cat.mods || cat;
+const mods = allMods.filter((m) => !ONLY || ONLY.has(m.id)).filter((m, i) => i % SHARD_N === SHARD_K);
 const zipOf = (m) => {
   const parts = [];
   for (let i = 0; i < (m.parts || 1); i++) parts.push(readFileSync(join(CAT, 'm', `${m.id}.${i}.bin`)));
@@ -96,6 +111,8 @@ async function run(mod) {
               filesAsked: null, filesRead: null, filesReadSample: [] };
   const t0 = Date.now();
   const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  let timedOut = false;
+  const watchdog = setTimeout(() => { timedOut = true; context.close().catch(() => {}); }, MAX_MS);
   // breakdb=1 poisons the origin the way this driver's first version did, before
   // any page script runs: a versionless open creates isaac-mods EMPTY at version
   // 1, so the page's own open(name, 1) never fires onupgradeneeded and its
@@ -170,6 +187,22 @@ async function run(mod) {
       await page.waitForSelector('#mods-file', { state: 'attached', timeout: 120000 });
       const buf = zipOf(mod);
       r.hasLua = zipNames(buf).some((n) => /(^|\/)main\.lua$/i.test(n));
+      // round 95: what it requires goes in first, the way the page would install it
+      const chain = requiredChain(allMods, mod.id);
+      if (chain.missing.length) throw new Error(`requires ${chain.missing.join(', ')}, not in the catalogue`);
+      r.requires = chain.order.slice(0, -1).map((e) => e.id);
+      for (const dep of chain.order.slice(0, -1)) {
+        const before = console_.filter((l) => /^\[mods\] .*: \d+ file\(s\)$/.test(l)).length;
+        await page.setInputFiles('#mods-file', { name: `${dep.id}.zip`, mimeType: 'application/zip', buffer: zipOf(dep) });
+        const deadline = Date.now() + 180000;
+        while (console_.filter((l) => /^\[mods\] .*: \d+ file\(s\)$/.test(l)).length <= before) {
+          const bad = console_.find((l) => /^\[mods\] import failed:/.test(l));
+          if (bad) throw new Error(`requirement ${dep.id}: ${bad}`);
+          if (Date.now() > deadline) throw new Error(`requirement ${dep.id} never finished importing`);
+          await sleep(300);
+        }
+      }
+      const imported0 = console_.filter((l) => /^\[mods\] .*: \d+ file\(s\)$/.test(l)).length;
       await page.setInputFiles('#mods-file', { name: `${mod.id}.zip`, mimeType: 'application/zip', buffer: buf });
       // The page's own report is the witness, not the database. Reading
       // IndexedDB from here is not free: `indexedDB.open(name)` with no version
@@ -181,7 +214,8 @@ async function run(mod) {
       const said = await (async () => {
         const deadline = Date.now() + 180000;
         for (;;) {
-          const line = console_.find((l) => /^\[mods\] .*: \d+ file\(s\)$/.test(l) || /^\[mods\] import failed:/.test(l));
+          const line = console_.filter((l) => /^\[mods\] .*: \d+ file\(s\)$/.test(l))[imported0]
+            || console_.find((l) => /^\[mods\] import failed:/.test(l));
           if (line) return line;
           if (Date.now() > deadline) return null;
           await sleep(300);
@@ -287,15 +321,33 @@ async function run(mod) {
     if (trap) r.why.push('trapped: ' + trap);
     const luaErr = await logMatch(new RegExp(`ERROR[^,\\n]*(${r.modDir || 'mods/'}|\\.lua)[^,\\n]*`));
     if (luaErr) r.errors.push(luaErr);
+    // round 95: the engine's own log, kept; with strict=1 a Lua error out of this
+    // mod's files fails it
+    const gameLog = await page.evaluate(() => (window.isaacLog || []).map(String)).catch(() => []);
+    writeFileSync(join(OUT, `${mod ? mod.id : 'baseline'}.game.log`), gameLog.join('\n'));
+    if (STRICT && r.modDir) {
+      const dir = r.modDir.toLowerCase();
+      // the engine's own forms only: "ERR: //mods/<dir>/main.lua:2: ...", "There was an
+      // error running the lua file: //mods/<dir>/...", and a callback's
+      // `Error in "X" call: ...<dir>/....lua:N: ...` (a file or mod NAMED "error" is not one)
+      const own = gameLog.filter((l) => {
+        const s = l.toLowerCase();
+        return s.includes(dir) && /\berr: |error running the lua file|error in "[^"]+" call|\.lua:\d+: /.test(s);
+      });
+      if (own.length) r.why.push(`Lua error: ${own[0].slice(0, 200)}`);
+      r.luaErrors = own.slice(0, 10);
+    }
     if (r.startedAfter === null) r.why.push('no run started');
     if (!r.fps.length) r.why.push('no frames sampled');
     r.ok = !r.why.length;
   } catch (e) {
-    r.why.push(e.message);
+    r.why.push(timedOut ? `timed out after ${MAX_MS / 1000}s (the page stopped answering)` : e.message);
   }
+  clearTimeout(watchdog);
+  if (timedOut && !r.why.some((w) => /timed out/.test(w))) { r.why.push(`timed out after ${MAX_MS / 1000}s`); r.ok = false; }
   r.ms = Date.now() - t0;
   writeFileSync(join(OUT, `${mod ? mod.id : 'baseline'}.console.log`), console_.join('\n'));
-  await context.close();
+  await context.close().catch(() => {});
   return r;
 }
 

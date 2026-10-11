@@ -377,6 +377,29 @@ export async function fetchCatalogue(base) {
   } catch { /* the short ones stand */ }
   return j;
 }
+// Round 95: what installing `id` downloads. A catalogue entry may carry `requires`
+// (catalogue ids, from its Steam Workshop page's Required items, modpack.py): those
+// come first, each after its own, and the mod last. Anything already in `installed`
+// is skipped along with what it needs; a cycle is cut where it closes; a requirement
+// the catalogue does not list is named in `missing`, and nothing is installed then.
+export function requiredChain(entries, id, installed = new Set()) {
+  const byId = new Map((entries || []).map((e) => [e.id, e]));
+  const order = [], missing = [], done = new Set();
+  const visit = (x, open) => {
+    if (done.has(x) || open.has(x)) return;
+    if (installed.has(x)) return;
+    const e = byId.get(x);
+    if (!e) { if (!missing.includes(x)) missing.push(x); return; }
+    open.add(x);
+    for (const r of Array.isArray(e.requires) ? e.requires : []) visit(r, open);
+    open.delete(x);
+    done.add(x);
+    order.push(e);
+  };
+  visit(id, new Set());
+  return { order, missing };
+}
+
 // The whole description for every catalogue entry the file names, marked as whole.
 export function mergeDescriptions(catalogue, full) {
   const texts = full && full.descriptions && typeof full.descriptions === 'object' ? full.descriptions : null;
@@ -474,6 +497,11 @@ export async function seedMods(db, seed, log, opts) {
     for (const f of files) for (const root of GUEST_ROOTS) if (seed(`${root}${mod.id}/${f.rel}`, f.bytes)) n += 1;
     out.mods += 1; out.files += n; out.bytes += size;
     log && log(`  ${mod.name} (${mod.id}): ${n} file(s), ${(size / 1048576).toFixed(2)} MB`);
+    // round 95: a seed the engine's file table refused is a file the mod will miss
+    // (the table overflowed at 16,384 entries before, dropping a big mod's last folders)
+    if (n < files.length * GUEST_ROOTS.length) {
+      log && log(`  ${mod.name}: ${files.length * GUEST_ROOTS.length - n} of ${files.length * GUEST_ROOTS.length} file(s) did not fit in the game's file table`);
+    }
   }
   // whatever the game wrote under mods/ last time, for a mod that is installed
   // and on. A disable.it is never seeded back: the flag it stands for lives in
@@ -507,6 +535,7 @@ export function createModsMenu(opts) {
   const fresh = new Set();                     // installed during this visit: they load on close
   const redraw = () => { paper.redraw(); if (browser && browser.isOpen()) browser.redraw(); };
   let progress = null, busyId = null;        // per cent of the mod being downloaded, and which
+  let step = null;                             // round 95: { at, of, name } while a chain installs
   let view = 'installed';                      // or 'browse'
   let search = '';
 
@@ -638,15 +667,18 @@ export function createModsMenu(opts) {
   // added from this device that the catalogue does not have (so they can go).
   function browserItems() {
     const have = new Map(mods.map((m) => [m.id, m]));
+    const byId = new Map(((catalogue && catalogue.mods) || []).map((m) => [m.id, m]));
     const list = ((catalogue && catalogue.mods) || []).map((m) => ({
       id: m.id, name: cleanModName(m.name), desc: describe(m.description, m.whole), version: m.version || '',
       bytes: m.bytes || 0, files: m.files || 0, installed: have.has(m.id), big: (m.bytes || 0) > SEED_BUDGET,
+      // round 95: what installing it brings along, by name
+      requires: (Array.isArray(m.requires) ? m.requires : []).map((r) => (byId.has(r) ? cleanModName(byId.get(r).name) : r)),
     }));
     const listed = new Set(list.map((m) => m.id));
     for (const m of mods) {
       if (listed.has(m.id)) continue;
       list.push({ id: m.id, name: cleanModName(m.name), desc: 'Added from this device.', version: m.version || '',
-        bytes: m.bytes || 0, files: m.files || 0, installed: true, big: false });
+        bytes: m.bytes || 0, files: m.files || 0, installed: true, big: false, requires: [] });
     }
     return list.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
   }
@@ -657,7 +689,7 @@ export function createModsMenu(opts) {
     message = null;
     await browser.open({
       items: browserItems,
-      status: () => ({ loading: catalogueLoading, error: catalogueError, busyId, progress, phase, message, fresh }),
+      status: () => ({ loading: catalogueLoading, error: catalogueError, busyId, progress, phase, message, fresh, step }),
       install: (id) => { const entry = catalogue && catalogue.mods.find((m) => m.id === id); return entry ? add(entry) : null; },
       remove: async (id) => { const mod = mods.find((m) => m.id === id); if (mod) await remove(mod); },
       addFromDevice: () => fileInput.click(),
@@ -667,33 +699,44 @@ export function createModsMenu(opts) {
     return true;
   }
 
+  // Round 95: a mod that needs others brings them: its required mods are downloaded
+  // and installed first (requiredChain), each once, under the one row the player
+  // chose, which counts them off (1 OF 2 ...).
   async function add(entry) {
     if (busy) return;
     busy = true;
     try {
       db = db || await openModDb();
       if (db && await getMod(db, entry.id)) throw new Error('already installed');
+      await refresh();
+      const { order, missing } = requiredChain((catalogue && catalogue.mods) || [entry], entry.id, new Set(mods.map((m) => m.id)));
+      if (missing.length) throw new Error(`it needs ${missing.join(', ')}, which the browser does not have`);
       // the row carries the percentage while it downloads, the line says what for
       busyId = entry.id;
-      progress = 0;
-      phase = 'download';
-      message = browser && browser.isOpen() ? null : 'DOWNLOADING...';
-      redraw();
-      const zip = await fetchMod(o.catalogueBase, entry, (n, total) => {
-        const pct = total ? Math.min(100, Math.round(100 * n / total)) : 0;
-        if (pct === progress) return;                    // a redraw a frame is plenty
-        progress = pct;
+      for (let i = 0; i < order.length; i++) {
+        const e = order[i];
+        step = order.length > 1 ? { at: i + 1, of: order.length, name: cleanModName(e.name) } : null;
+        progress = 0;
+        phase = 'download';
+        message = browser && browser.isOpen() ? null : (step ? `DOWNLOADING ${step.at} OF ${step.of}...` : 'DOWNLOADING...');
         redraw();
-      });
-      progress = null;
-      phase = 'unpack';
-      message = browser && browser.isOpen() ? null : 'UNPACKING...';
-      redraw();
-      await install(await unzip(zip.buffer.slice(zip.byteOffset, zip.byteOffset + zip.byteLength)), entry.name);
-      fresh.add(entry.id);
+        const zip = await fetchMod(o.catalogueBase, e, (n, total) => {
+          const pct = total ? Math.min(100, Math.round(100 * n / total)) : 0;
+          if (pct === progress) return;                    // a redraw a frame is plenty
+          progress = pct;
+          redraw();
+        });
+        progress = null;
+        phase = 'unpack';
+        message = browser && browser.isOpen() ? null : 'UNPACKING...';
+        redraw();
+        await install(await unzip(zip.buffer.slice(zip.byteOffset, zip.byteOffset + zip.byteLength)), e.name);
+        fresh.add(e.id);
+      }
+      if (order.length > 1) say(`${cleanModName(entry.name)} and ${order.length - 1} mod(s) it needs`, true);
       if (browser && browser.isOpen()) message = null;
     } catch (e) { say(`${entry.name}: ${e.message}`); }
-    busyId = null; progress = null; phase = null;
+    busyId = null; progress = null; phase = null; step = null;
     busy = false;
     redraw();
   }

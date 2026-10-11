@@ -37,8 +37,13 @@
  * 485-file resources/ subtree, the packed archives, and the game's own
  * save-dir entries. 512 slots overflowed at boot round 10 (resources/ only);
  * 8192 would overflow the whole tree (round 11). Widest directory is
- * gfx/characters/costumes with 1,675 children (per-scan cap below). */
-#define FS_SLOTS      16384u
+ * gfx/characters/costumes with 1,675 children (per-scan cap below).
+ * Round 95: 65536. A workshop mod is seeded under both mod roots, so a
+ * 9,403-file mod ("Auri") alone wants 18,806 slots, and at 16,384 the files
+ * sorting last (its whole resources/sfx) were dropped without a word. The
+ * slot shrank to fit (the window caches moved out, below), so the table costs
+ * about what 16,384 slots did. */
+#define FS_SLOTS      65536u
 #define FS_FILE_RG    64u
 #define FS_FIND_RG    8u
 #define FS_FIND_MAX   2048u
@@ -54,17 +59,27 @@ typedef struct {
     uint8_t *data;            /* file bytes (host heap) */
     uint32_t size, cap;
     char    *src;             /* lazy entries: the seed path the loader reads */
-    uint8_t *win[FS_WIN_SLOTS]; /* windowed entries: FS_WIN-byte caches of the host file, LRU (round 41) */
+    uint8_t  wc;              /* round 95: a windowed entry's caches, 1 + its g_wc index (0: none) */
+} fs_entry;
+
+/* A windowed entry's FS_WIN-byte caches of the host file, LRU (round 41).
+ * Round 95: beside the table rather than in every slot -- their bookkeeping
+ * was 532 of a slot's 696 bytes, for the dozen archives that are windowed. */
+typedef struct {
+    uint8_t *win[FS_WIN_SLOTS];
     uint32_t win_off[FS_WIN_SLOTS], win_len[FS_WIN_SLOTS], win_tick[FS_WIN_SLOTS];
     uint8_t  win_last;        /* the slot used last */
-} fs_entry;
+    uint8_t  used;
+} fs_wincache;
+#define FS_WIN_FILES 64u
+static fs_wincache g_wc[FS_WIN_FILES];
 
 static fs_entry g_fs[FS_SLOTS];
 
 /* Round 12f: key -> slot hash index (open addressing, FNV-1a). fs_find was a
  * strcmp over all 16384 slots per lookup -- 1 s of a 12 s boot once the
  * allocator stopped hiding it. Deletes rebuild the index (rare). */
-#define FS_HASH 65536u
+#define FS_HASH 262144u                      /* round 95: 4x FS_SLOTS, as before */
 static uint32_t g_fs_hash[FS_HASH];          /* slot index + 1, 0 = empty */
 static uint32_t fs_hash_key(const char *k) {
     uint32_t h = 2166136261u;
@@ -185,6 +200,7 @@ static fs_entry *fs_find(const char *key) {
 }
 
 static uint32_t g_fs_next_free;              /* rotating hint for fs_new */
+static uint32_t g_fs_high;                   /* round 95: one past the highest slot ever used; scans stop there */
 static fs_entry *fs_new(const char *key, int is_dir) {
     fs_entry *e = fs_find(key);
     if (e) return e;
@@ -197,16 +213,18 @@ static fs_entry *fs_new(const char *key, int is_dir) {
             g_fs[i].live = 1;
             fs_hash_insert(i);
             g_fs_next_free = (i + 1u) % FS_SLOTS;
+            if (i + 1u > g_fs_high) g_fs_high = i + 1u;
             return &g_fs[i];
         }
     }
     return NULL;
 }
 
+static void fs_window_drop(fs_entry *e);
 static void fs_free_entry(fs_entry *e) {
     if (e->data) free(e->data);
     if (e->src) free(e->src);
-    for (unsigned wk = 0; wk < FS_WIN_SLOTS; ++wk) if (e->win[wk]) free(e->win[wk]);
+    if (e->wc) fs_window_drop(e);
     memset(e, 0, sizeof *e);
     fs_hash_rebuild();                        /* deletes are rare; keep the index exact */
 }
@@ -359,57 +377,60 @@ static int fs_pread(const char *src, uint8_t *dst, uint32_t off, uint32_t len) {
  * slots are an LRU set; the window used last is tried first. */
 static uint32_t fs_window_read(fs_entry *e, uint64_t pos, uint32_t want, uint8_t *dst) {
     uint32_t done = 0;
+    if (!e->wc) return 0;
+    fs_wincache *w = &g_wc[e->wc - 1u];
     while (done < want) {
         uint64_t p = pos + done;
         unsigned k, hit = FS_WIN_SLOTS;
         if (p >= e->size) break;
-        k = e->win_last;
-        if (e->win[k] && p >= e->win_off[k] && p < (uint64_t)e->win_off[k] + e->win_len[k]) hit = k;
+        k = w->win_last;
+        if (w->win[k] && p >= w->win_off[k] && p < (uint64_t)w->win_off[k] + w->win_len[k]) hit = k;
         else for (k = 0; k < FS_WIN_SLOTS; ++k)
-            if (e->win[k] && p >= e->win_off[k] && p < (uint64_t)e->win_off[k] + e->win_len[k]) { hit = k; break; }
+            if (w->win[k] && p >= w->win_off[k] && p < (uint64_t)w->win_off[k] + w->win_len[k]) { hit = k; break; }
         if (hit == FS_WIN_SLOTS) {
             uint64_t start = p & ~(uint64_t)(FS_WIN - 1u);
             uint32_t len = (uint32_t)((e->size - start) < FS_WIN ? (e->size - start) : FS_WIN);
             int n;
             unsigned oldest = 0;
             for (k = 0; k < FS_WIN_SLOTS; ++k) {          /* an empty slot, else the least recently used */
-                if (!e->win[k]) { oldest = k; break; }
-                if (e->win_tick[k] < e->win_tick[oldest]) oldest = k;
+                if (!w->win[k]) { oldest = k; break; }
+                if (w->win_tick[k] < w->win_tick[oldest]) oldest = k;
             }
             k = oldest;
-            if (!e->win[k]) e->win[k] = (uint8_t *)malloc(FS_WIN);
-            if (!e->win[k]) break;
-            n = fs_pread(e->src ? e->src : e->key, e->win[k], (uint32_t)start, len);
+            if (!w->win[k]) w->win[k] = (uint8_t *)malloc(FS_WIN);
+            if (!w->win[k]) break;
+            n = fs_pread(e->src ? e->src : e->key, w->win[k], (uint32_t)start, len);
             ++g_win_fills;
             if (n <= 0) {
                 isaac_log("[isaac][fs] windowed read of '%s' at %llu (%u bytes) FAILED (%d)",
                           e->src ? e->src : e->key, (unsigned long long)start, len, n);
-                e->win_len[k] = 0;
+                w->win_len[k] = 0;
                 break;
             }
-            e->win_off[k] = (uint32_t)start; e->win_len[k] = (uint32_t)n;
-            if (p >= (uint64_t)e->win_off[k] + e->win_len[k]) break;
+            w->win_off[k] = (uint32_t)start; w->win_len[k] = (uint32_t)n;
+            if (p >= (uint64_t)w->win_off[k] + w->win_len[k]) break;
             hit = k;
         } else ++g_win_hits;
-        e->win_tick[hit] = ++g_win_tick;
-        e->win_last = (uint8_t)hit;
+        w->win_tick[hit] = ++g_win_tick;
+        w->win_last = (uint8_t)hit;
         {
-            uint32_t o = (uint32_t)(p - e->win_off[hit]);
-            uint32_t chunk = e->win_len[hit] - o;
+            uint32_t o = (uint32_t)(p - w->win_off[hit]);
+            uint32_t chunk = w->win_len[hit] - o;
             if (chunk > want - done) chunk = want - done;
-            memcpy(dst + done, e->win[hit] + o, chunk);
+            memcpy(dst + done, w->win[hit] + o, chunk);
             done += chunk;
         }
     }
     return done;
 }
 static void fs_window_drop(fs_entry *e) {
-    unsigned k;
-    for (k = 0; k < FS_WIN_SLOTS; ++k) {
-        if (e->win[k]) { free(e->win[k]); e->win[k] = NULL; }
-        e->win_off[k] = e->win_len[k] = e->win_tick[k] = 0;
+    if (e->wc) {
+        fs_wincache *w = &g_wc[e->wc - 1u];
+        for (unsigned k = 0; k < FS_WIN_SLOTS; ++k) if (w->win[k]) free(w->win[k]);
+        memset(w, 0, sizeof *w);              /* and free for the next windowed entry */
+        e->wc = 0;
     }
-    e->win_last = 0; e->windowed = 0;
+    e->windowed = 0;
 }
 uint32_t isaac_fs_lazy_windowed(void) { return g_lazy_windowed; }
 /* the window census: host reads (fills) and reads served from a resident window */
@@ -433,7 +454,14 @@ int isaac_archive_verify_on(void) {
 
 static int fs_materialise(fs_entry *e) {
     if (!e || !e->lazy) return 1;
-    if (e->size >= fs_window_min() && fs_pread_avail()) {
+    unsigned wc = 0;
+    while (wc < FS_WIN_FILES && g_wc[wc].used) ++wc;
+    if (e->size >= fs_window_min() && fs_pread_avail() && wc == FS_WIN_FILES)
+        isaac_log("[isaac][fs] no window cache left for '%s'; it is loaded whole", e->src ? e->src : e->key);
+    if (e->size >= fs_window_min() && fs_pread_avail() && wc < FS_WIN_FILES) {
+        memset(&g_wc[wc], 0, sizeof g_wc[wc]);
+        g_wc[wc].used = 1;
+        e->wc = (uint8_t)(wc + 1u);
         e->lazy = 0; e->windowed = 1;
         ++g_lazy_windowed;
         isaac_log("[isaac][fs] '%s' (%u bytes) is served through a %u KB window, never loaded whole",
@@ -627,7 +655,7 @@ void imp_kernel32__RemoveDirectoryA(CpuState *restrict cpu) {
     if (!e->is_dir) { fs_err_set(5u); cpu->EAX = 0; return; }
     /* empty check */
     size_t pref = strlen(key);
-    for (unsigned i = 0; i < FS_SLOTS; ++i) {
+    for (unsigned i = 0; i < g_fs_high; ++i) {
         if (!g_fs[i].live) continue;
         if (strncmp(g_fs[i].key, key, pref) == 0 && g_fs[i].key[pref] == '/') {
             fs_err_set(145u); cpu->EAX = 0; return;      /* ERROR_DIR_NOT_EMPTY */
@@ -684,7 +712,7 @@ static int fs_find_open(const char *key) {
     if (sid == 0xFFFFFFFFu) return -2;
     size_t pref = strlen(key);
     uint32_t cnt = 0;
-    for (unsigned i = 0; i < FS_SLOTS && cnt < FS_FIND_MAX; ++i) {
+    for (unsigned i = 0; i < g_fs_high && cnt < FS_FIND_MAX; ++i) {
         if (!g_fs[i].live) continue;
         const char *k = g_fs[i].key;
         if (strncmp(k, key, pref) == 0 && k[pref] == '/' &&

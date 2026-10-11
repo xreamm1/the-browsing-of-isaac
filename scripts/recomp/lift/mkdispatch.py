@@ -482,11 +482,19 @@ static void isaac_guest_call_inner(uint32_t va, CpuState *restrict cpu) {
 void isaac_guest_jmp_save(void *dst) { memcpy(dst, g_guest_jmp, sizeof(jmp_buf)); }
 void isaac_guest_jmp_restore(const void *src) { memcpy(g_guest_jmp, src, sizeof(jmp_buf)); }
 unsigned isaac_guest_jmp_size(void) { return (unsigned)sizeof(jmp_buf); }
+/* Round 95: the guest ESP at the innermost isaac_guest_call, 0xFFFFFFFF outside
+ * any. A C++ catch the host carries out (host_shims_eh.c) resumes through this
+ * call's replay, so it only takes a catching frame below it. A slice that
+ * yields skips the restore; the slice runner restores it itself. */
+uint32_t g_guest_call_esp = 0xFFFFFFFFu;
 void isaac_guest_call(uint32_t va, CpuState *restrict cpu) {
   jmp_buf saved;
+  uint32_t esp_saved = g_guest_call_esp;
   memcpy(saved, g_guest_jmp, sizeof(jmp_buf));
+  g_guest_call_esp = cpu->ESP;
   isaac_guest_call_inner(va, cpu);
   memcpy(g_guest_jmp, saved, sizeof(jmp_buf));
+  g_guest_call_esp = esp_saved;
 }
 ''')
 

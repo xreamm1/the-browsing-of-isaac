@@ -359,6 +359,11 @@ void imp_api_ms_win_crt_stdio____stdio_common_vsscanf(CpuState *restrict cpu) {
 void imp_vcruntime140___CxxThrowException(CpuState *restrict cpu) {
     static const isaac_import *self;
     if (!self) self = self_by_symbol("vcruntime140.dll", "_CxxThrowException");
+    /* Round 95: a throw the image catches itself (a Lua error's
+     * luabridge::LuaException, caught by a LuaEngine dispatcher) is carried
+     * out by host_shims_eh.c and never comes back here; anything it cannot
+     * carry out returns, untouched, to the trap below. */
+    isaac_eh_throw(cpu);
     /* THROW AND UNWIND ARE SEPARATE MECHANISMS, and the earlier finding about
      * __CxxFrameHandler3 does not cover this side. That result was: lifted
      * code never CALLS the frame handler, so unwinding is never entered on a

@@ -24,8 +24,11 @@ test('isaac_guest_call is nesting-safe: the jmp_buf is saved around every call',
   const mk = readFileSync(join(lift, 'mkdispatch.py'), 'utf8');
   assert.ok(mk.includes('static void isaac_guest_call_inner(uint32_t va, CpuState *restrict cpu) {'),
     'the setjmp body is the inner function');
-  assert.ok(/void isaac_guest_call\(uint32_t va, CpuState \*restrict cpu\) \{\s*jmp_buf saved;\s*memcpy\(saved, g_guest_jmp, sizeof\(jmp_buf\)\);\s*isaac_guest_call_inner\(va, cpu\);\s*memcpy\(g_guest_jmp, saved, sizeof\(jmp_buf\)\);/.test(mk),
-    'the public entry saves and restores the outer frame\'s jmp_buf');
+  assert.ok(/void isaac_guest_call\(uint32_t va, CpuState \*restrict cpu\) \{\s*jmp_buf saved;\s*uint32_t esp_saved = g_guest_call_esp;\s*memcpy\(saved, g_guest_jmp, sizeof\(jmp_buf\)\);\s*g_guest_call_esp = cpu->ESP;\s*isaac_guest_call_inner\(va, cpu\);\s*memcpy\(g_guest_jmp, saved, sizeof\(jmp_buf\)\);\s*g_guest_call_esp = esp_saved;/.test(mk),
+    'the public entry saves and restores the outer frame\'s jmp_buf, and (round 95) the guest ESP it was entered at');
+  const modsrc = readFileSync(join(host, 'host_shims_module.c'), 'utf8');
+  assert.ok(/const uint32_t guest_esp_saved = g_guest_call_esp;[^]*?isaac_guest_jmp_restore\(guest_saved\);\s*g_guest_call_esp = guest_esp_saved;/.test(modsrc),
+    'round 95: a slice that yields restores the guest-call ESP with the jmp_buf');
   assert.ok(mk.includes('void isaac_guest_jmp_save(void *dst)') && mk.includes('void isaac_guest_jmp_restore(const void *src)'),
     'a slice that yields restores it through the accessors');
 });

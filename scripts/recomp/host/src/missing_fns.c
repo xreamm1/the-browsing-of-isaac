@@ -292,6 +292,7 @@ __attribute__((weak)) void isaac_guest_jmp_restore(const void *src) { (void)src;
 __attribute__((weak)) uint32_t g_reentry_eip;  /* ditto; the no-progress guard in recomp_run_pending reads it */
 __attribute__((weak)) const uint32_t g_dva[1] = {0};
 __attribute__((weak)) const uint32_t g_ndispatch = 0;
+__attribute__((weak)) uint32_t g_guest_call_esp = 0xFFFFFFFFu;   /* round 95: dispatch_tbl.c */
 
 /* Guest longjmp unwind to isaac_guest_call. The standalone selftest has no
  * guest call frame to unwind to; reaching here in that build is a defect,

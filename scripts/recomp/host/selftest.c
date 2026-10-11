@@ -129,6 +129,115 @@ double isaac_render_gate_wait_ms(void);
 double isaac_render_gate_carry_ms(void);
 double isaac_render_gate_pace_ms(double now_ms);
 uint32_t isaac_render_gate_intervals(int cls, double *mean_ms, double *max_ms);
+/* Round 95: the C++ catch the host carries out (host_shims_eh.c), on tables
+ * laid out the way MSVC lays them out, in a scratch corner of the guest. */
+static void eh_str(uint32_t va, const char *s) { for (; *s; ++s, ++va) *(uint8_t *)isaac_g(va) = (uint8_t)*s; *(uint8_t *)isaac_g(va) = 0; }
+static void eh_thunk(uint32_t va, uint32_t fi, int indirect) {
+    uint8_t *b = (uint8_t *)isaac_g(va);
+    b[0] = 0xB8; memcpy(b + 1, &fi, 4);
+    if (indirect) { b[5] = 0xFF; b[6] = 0x25; memset(b + 7, 0, 4); } else { b[5] = 0xE9; memset(b + 6, 0, 4); }
+}
+/* the /GS form this image uses (0x00b04ecd): nop nop, a cookie check, then the pair */
+static void eh_thunk_gs(uint32_t va, uint32_t fi) {
+    static const uint8_t pre[] = {0x90, 0x90, 0x8b, 0x54, 0x24, 0x08, 0x8d, 0x42, 0x0c, 0x8b, 0x4a, 0xcc,
+                                  0x33, 0xc8, 0xe8, 0x00, 0x00, 0x00, 0x00};
+    memcpy(isaac_g(va), pre, sizeof pre);
+    eh_thunk(va + (uint32_t)sizeof pre, fi, 0);
+}
+static void eh_w(uint32_t va, const uint32_t *v, unsigned n) { for (unsigned i = 0; i < n; ++i) isaac_w32(va + 4u * i, v[i]); }
+static void test_eh(void) {
+    const uint32_t S = ISAAC_STACK_TOP_VA - 0x30000u;
+    const uint32_t TD_LUA = S, TD_STD = S + 0x40u, TD_OTHER = S + 0x80u, TD_STD2 = S + 0xc0u;
+    eh_str(TD_LUA + 8u, ".?AVLuaException@luabridge@@");
+    eh_str(TD_STD + 8u, ".?AVexception@std@@");
+    eh_str(TD_OTHER + 8u, ".?AVother@@");
+    eh_str(TD_STD2 + 8u, ".?AVexception@std@@");                 /* the same type, another descriptor */
+    const uint32_t CT1 = S + 0x100u, CT2 = S + 0x120u, CTA = S + 0x140u, TI = S + 0x150u;
+    { const uint32_t v[] = {0, TD_LUA, 0, 0xFFFFFFFFu, 0, 0x28, 0}; eh_w(CT1, v, 7); }
+    { const uint32_t v[] = {0, TD_STD, 4, 0xFFFFFFFFu, 0, 0x0c, 0}; eh_w(CT2, v, 7); }
+    { const uint32_t v[] = {2, CT1, CT2}; eh_w(CTA, v, 3); }
+    { const uint32_t v[] = {0, 0x0085c1d0u, 0, CTA}; eh_w(TI, v, 4); }
+    const uint32_t FI0 = S + 0x300u, FI1 = S + 0x380u, FI2 = S + 0x440u;
+    const uint32_t H0 = S + 0x200u, H1 = S + 0x220u;
+    { const uint32_t v[] = {0x19930522u, 1, S + 0x340u, 0, 0}; eh_w(FI0, v, 5); }
+    { const uint32_t v[] = {0x19930522u, 1, S + 0x360u, 1, S + 0x3c0u}; eh_w(FI1, v, 5); }
+    { const uint32_t v[] = {0, 0, 1, 1, S + 0x400u}; eh_w(S + 0x3c0u, v, 5); }                  /* try 0..0 */
+    { const uint32_t v[] = {9, TD_OTHER, 0xFFFFFFE8u, 0x00111111u}; eh_w(S + 0x400u, v, 4); }   /* catch (const other &) */
+    { const uint32_t v[] = {0x19930522u, 4, S + 0x420u, 1, S + 0x480u}; eh_w(FI2, v, 5); }
+    { const uint32_t v[] = {1, 2, 3, 2, S + 0x4c0u}; eh_w(S + 0x480u, v, 5); }                  /* try 1..2, two catches */
+    { const uint32_t v[] = {9, TD_OTHER, 0xFFFFFFE4u, 0x00222222u,
+                            9, TD_STD2, 0xFFFFFFE4u, 0x00860826u}; eh_w(S + 0x4c0u, v, 8); }
+    const uint32_t H2 = S + 0x260u;
+    eh_thunk(H0, FI0, 0); eh_thunk(H1, FI1, 1); eh_thunk_gs(H2, FI2);
+    const uint32_t N0 = S + 0x1000u, N1 = S + 0x1100u, N2 = S + 0x1200u;
+    { const uint32_t v[] = {N1, H0, 0}; eh_w(N0, v, 3); }
+    { const uint32_t v[] = {N2, H1, 0}; eh_w(N1, v, 3); }
+    { const uint32_t v[] = {0xFFFFFFFFu, H2, 1}; eh_w(N2, v, 3); }
+
+    isaac_eh_plan_t p;
+    check(isaac_eh_funcinfo(H0) == FI0 && isaac_eh_funcinfo(H1) == FI1, "eh: an __ehhandler thunk names its FuncInfo (jmp rel32 or jmp [slot])");
+    check(isaac_eh_funcinfo(H2) == FI2, "eh: past the /GS cookie check this image's thunks open with");
+    check(isaac_eh_funcinfo(S + 0x150u) == 0u, "eh: anything else is not a C++ frame");
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 1 && p.node == N2 && p.ebp == N2 + 0xcu,
+          "eh: the third frame catches it");
+    check(p.handler == 0x00860826u && p.disp == 0xFFFFFFE4u && p.adjectives == 9u,
+          "eh: by its second handler (the first is for another type)");
+    check(p.mdisp == 4u && p.ptype == TD_STD2, "eh: as std::exception, matched by the decorated name, at that base's displacement");
+    check(p.state == 1 && p.try_low == 1 && p.try_high == 2, "eh: the try block covering state 1");
+    check(p.n_nested == 2u && p.nested_node[0] == N0 && p.nested_node[1] == N1 && p.nested_funcinfo[1] == FI1,
+          "eh: the thrower and the frame whose catch did not match are unwound first");
+    check(isaac_eh_plan(N0, TI, N2 + 0xcu, &p) == 0, "eh: a catching frame outside the innermost guest call is not taken");
+    isaac_w32(N2 + 8u, 0u);
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 0, "eh: a frame in a state no try covers does not catch");
+    isaac_w32(N2 + 8u, 3u);
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 0, "eh: nor one past the try (state 3, the catch's own)");
+    isaac_w32(N2 + 8u, 1u);
+    isaac_w32(S + 0x4c0u + 16u + 4u, 0u);                           /* the second handler becomes catch (...) */
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 1 && p.ptype == 0u && p.mdisp == 0u, "eh: catch (...) takes anything");
+    { const uint32_t v[] = {0, TD_LUA, 0xFFFFFFE4u, 0x00860826u}; eh_w(S + 0x4c0u + 16u, v, 4); }
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 0, "eh: a catch by value is not carried out");
+    { const uint32_t v[] = {8, TD_LUA, 0xFFFFFFE4u, 0x00860826u}; eh_w(S + 0x4c0u + 16u, v, 4); }
+    isaac_w32(N1 + 4u, S + 0x150u);                                 /* the middle frame is not C++ */
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 0, "eh: a frame that is not C++ stops the walk");
+    isaac_w32(N1 + 4u, H1);
+    isaac_w32(FI2, 0x19930519u);
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 0, "eh: a FuncInfo without the magic is not read");
+    isaac_w32(FI2, 0x19930522u);
+    check(isaac_eh_plan(N0, TI, 0xFFFFFFFFu, &p) == 1 && p.mdisp == 0u && p.ptype == TD_LUA, "eh: and with it, LuaException itself");
+
+    /* the continuation epilogues, on a frame built by hand */
+    CpuState c; memset(&c, 0, sizeof c);
+    const uint32_t F = S + 0x2000u;
+    isaac_w32(F, 0x0BADF00Du); isaac_w32(F + 4u, 0x00ABCDEFu);       /* saved ebp, return address */
+    isaac_w32(F - 0xcu, 0x01234560u); isaac_w32(F - 0x14u, 0x00001234u);
+    const uint32_t sp = F - 0x40u;                                  /* the pushes, below the locals */
+    { const uint32_t v[] = {0xEC, 0xED, 0xE5, 0xEB}; eh_w(sp, v, 4); }   /* ecx edi esi ebx */
+    c.EBP = F; c.ESP = sp; c.EAX = 0x00865d9eu;
+    check(isaac_eh_tail(0x00865d9eu, &c) == 1 && c.EAX == 0x1234u && c.EIP == 0x00ABCDEFu && c.ESP == F + 8u + 8u,
+          "eh: GetPill's continuation returns its local and pops 8");
+    check(c.EBX == 0xEBu && c.ESI == 0xE5u && c.EDI == 0xEDu && c.ECX == 0xECu && c.EBP == 0x0BADF00Du,
+          "eh: and restores the registers its prologue saved");
+    check(isaac_r32(ISAAC_TEB_VA) == 0x01234560u, "eh: and fs:[0] from [ebp-0xc]");
+    isaac_w32(F - 0x11u, 0x000000A5u);
+    c.EBP = F; c.ESP = sp; c.EAX = 0x00864d61u;
+    check(isaac_eh_tail(0x00864d61u, &c) == 1 && c.EAX == 0x00864da5u && c.ESP == F + 8u + 0x10u,
+          "eh: the bool action hook returns the byte it held, in AL only");
+    /* the aligned frame: ebx holds the pre-alignment esp */
+    const uint32_t G = F + 0x100u;
+    isaac_w32(G - 0x14u, 0x00000000u);
+    isaac_w32(G - 0x1cu, 0x00007777u);
+    isaac_w32(G, 0x0BADBEEFu);
+    const uint32_t outer = G + 0x40u;
+    isaac_w32(G - 0x14u, outer);
+    isaac_w32(outer, 0x0000EB0Bu); isaac_w32(outer + 4u, 0x00FEDCBAu);
+    { const uint32_t v[] = {0xEC, 0xED, 0xE5}; eh_w(G - 0x40u, v, 3); }
+    c.EBP = G; c.ESP = G - 0x40u; c.EAX = 0x008659f9u;
+    check(isaac_eh_tail(0x008659f9u, &c) == 1 && c.EAX == 0x7777u && c.EBX == 0xEB0Bu && c.EIP == 0x00FEDCBAu
+          && c.ESP == outer + 8u + 8u && c.EBP == 0x0BADBEEFu && c.ESI == 0xE5u,
+          "eh: GetTrinket's aligned frame returns its local through mov esp,ebx");
+    check(isaac_eh_tail(0x00865602u, &c) == 0, "eh: GetShaderParams' continuation is not translated");
+}
+
 /* Round 94: a sliced job asleep until wake_ms sits out a frame at now_ms. */
 int isaac_threads_napping(double wake_ms, double now_ms);
 static void test_thread_naps(void) {
@@ -342,6 +451,7 @@ static int selftest_fs_read_is(uint32_t scratch, const char *path,
 int main(int argc, char **argv) {
     test_render_gate();
     test_thread_naps();
+    test_eh();
     printf("--- isaac host layer selftest ---\n");
     if (argc > 1) load_image(argv[1]);
 

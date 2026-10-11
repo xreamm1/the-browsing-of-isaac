@@ -606,8 +606,10 @@ static void slice_job(unsigned i, CpuState *restrict cpu) {
     extern uint32_t recomp_jmp_pending;
     extern uint32_t g_reentry_eip;
     extern struct CpuState *recomp_last_cpu;
+    extern uint32_t g_guest_call_esp;
     {
         jmp_buf guest_saved;
+        const uint32_t guest_esp_saved = g_guest_call_esp;   /* round 95 */
         isaac_guest_jmp_save(guest_saved);
         /* Enter the LOOP function with its long-lived object, not the
          * trampoline: the engine's job wrapper 0x00a5a760 reads {obj, fn,
@@ -646,6 +648,7 @@ static void slice_job(unsigned i, CpuState *restrict cpu) {
         g_reentry_eip = 0u;
         recomp_last_cpu = (struct CpuState *)cpu;
         isaac_guest_jmp_restore(guest_saved);
+        g_guest_call_esp = guest_esp_saved;
     }
 }
 

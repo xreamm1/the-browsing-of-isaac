@@ -8818,3 +8818,107 @@ memo keyed on the name's address would need the names to be immutable, which
 is not established. The audio thread's remaining 5.7% is stb_vorbis decoding real
 music (residue `0x00aa2580`, codebook `0x00aa44d0`), the open item from
 rounds 49-50.
+
+### 21.121 Round 95: a player's workshop folder, tested on Repentance+, with what each mod requires
+
+**The catalogue.** The mod browser's catalogue is now the mods installed in a
+real Steam workshop folder: 210 folders, 2.0 GB. Every one of them was run
+through the web engine before it was listed, and this engine is
+Repentance+, so "works with Rep+" was measured rather than read off a tag.
+
+`drive_modpack.mjs strict=1` checks each mod in a fresh browser context:
+
+- install it through the page's own file input, reload, boot;
+- press Enter until the engine logs a run start, then walk and fire;
+- pass only if the engine's own log says it loaded the mod and ran its
+  `main.lua`, nothing trapped, the frame rate held, and no Lua error names
+  the mod's files.
+
+The Lua error forms counted are the engine's own:
+`ERR: //mods/<dir>/main.lua:N: ...`, `There was an error running the lua
+file`, and `Error in "X" call: ...`. A mod or file merely named "error" does
+not count; the first version of the check failed `moderrorcontainer` and
+Auri's `auri_game_error.wav` that way. A per-mod watchdog (`maxsec`) closes a
+context that stops answering. `shard=k/n` splits the run across parallel
+drivers, and `requires` are installed first (`requiredChain`).
+
+**Dependencies.** A mod's Required items exist only on its Steam Workshop
+page, not in its files. `.scratch/mods-local/inventory.py workshop` reads each
+page's `#RequiredItems` block. Steam answers 429 after about 10 quick
+requests, so the reader backs off from 30 s to 300 s and caches per id.
+
+- `modpack.py --requires` turns those Workshop ids into catalogue ids
+  (`requires`), from the metadata `<id>` or the folder's `_<id>` suffix.
+- A mod whose requirement the catalogue cannot carry is left out, and so is
+  anything that needs it in turn: requirements that are missing, too big, or
+  REPENTOGON (a Windows DLL; its workshop item is a 0 MB stub).
+- `--select` packs a subset of folders; `--keep` carries entries this build
+  does not make.
+
+In the page, `requiredChain()` orders the requirements first, each once, then
+the mod. It skips anything installed and cuts a cycle where it closes. `add()`
+downloads the whole chain under the one row the player chose ("1 OF 2"), and
+the detail page reads `REQUIRES ...`.
+
+**Two engine defects the run found.**
+
+1. A Lua error in any mod callback ended the game. Rep+'s `_RunCallback`
+   (`scripts/main.lua`) calls the mod with no `pcall`. The engine's
+   `lua_pcallk` wrappers then throw `luabridge::LuaException` (`0x008727d0`,
+   ThrowInfo `0x00bd5bf8`) to one of 72 `LuaEngine` dispatchers whose
+   `catch (const LuaException &)` logs `Error in "X" call: ...` and goes on.
+   The port had no C++ exception runtime, so `_CxxThrowException` trapped.
+
+   `host_shims_eh.c` now carries the catch out from the image's own tables.
+   It walks `fs:[0]`, reading each frame's FuncInfo from its `__ehhandler`
+   thunk. This image is `/GS`, so each thunk first runs one or two cookie
+   checks, and the scan looks past them to `mov eax, FuncInfo; jmp`. It then:
+   - runs the unwind actions of the frames between;
+   - binds the catch object and calls the catch funclet;
+   - destroys the exception object;
+   - resumes at the continuation through the guest-longjmp replay.
+
+   Ghidra made 61 of the 72 continuations functions of their own, so the
+   dispatcher resumes them as lifted entries. The other ten are plain
+   epilogues, translated exactly (`isaac_eh_tail`). GetShaderParams continues
+   into calls and is left to trap. A catch outside the innermost guest call
+   is not taken: `g_guest_call_esp` is saved in `isaac_guest_call`, and by the
+   slice runner when a slice yields.
+
+   The selftest drives the walk on synthetic tables (21 checks); 10 mutants
+   were killed. In the browser, a mod with a nil index in PostUpdate and a nil
+   call in PostRender logged 162 and about 450 `Error in "..." call` lines,
+   the PC's words, while the game ran on at 60 fps.
+2. A big mod lost files. A mod is seeded under both mod roots, so Auri's
+   9,403 files wanted 18,806 slots of a 16,384-slot RAM-FS. The files sorting
+   last were refused without a word, and its whole `resources/sfx` never
+   arrived. The table is 65,536 slots now. A slot's 32 window caches (532 of
+   its 696 bytes) moved to a 64-entry side table, since only the archives are
+   windowed, so the table costs about what it did. Directory scans stop at
+   the highest slot used, and the page reports a seed the table refused.
+
+**The run.** 206 mods were tested on the r13 engine, in 4 shards.
+
+- 203 passed. 202 are listed (REPENTOGON's stub left out); the previous
+  catalogue's one mod this folder no longer has, (REP) Improved Chargebar,
+  is carried with `--keep`. That makes 203 entries, 412.5 MB in 209 parts,
+  the largest 19.00 MB.
+- 3 hang the boot before the engine lists them: Encyclopedia (400 MB live in
+  the 384 MB guest arena), More Special Rooms in Greed, and StageAPI 1.5.
+  All three work on a PC, so this is a port defect still to find. Anything
+  requiring StageAPI is left out with it.
+- 4 are over the 96 MB the page can seed and are never packed: Antibirth
+  music+++, Fiend Folio: Reloaded, Car, and Rotoscoped Reactions.
+
+127 of the 210 Workshop pages had been read when the catalogue was cut, with
+three mods requiring others. Even More Shopkeepers requires eyeguy's EXTRA
+NPCs: in the page, its detail reads `REQUIRES EYEGUY'S EXTRA NPCS`, and one
+Enter installed both, in that order (`mod-deps-check.mjs`). Every listed mod
+passed alone, so a requirement not yet known costs only what the mod would
+have used it for.
+
+**Hosting.** The catalogue lives on jsDelivr, in boi-portable `mods/`. Both
+pages (tboi.online and GitHub Pages) name it at a pinned commit, `@<sha>/mods`
+rather than `@main`. A part keeps its name when its mod changes, and
+jsDelivr holds a branch path for up to 7 days, so a catalogue update is a
+page update, like the streams. The VPS serves no mod bytes now.

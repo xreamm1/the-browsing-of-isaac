@@ -393,6 +393,23 @@ int32_t isaac_fast_x87_trunc_i32(double d);
 int  isaac_editfile_gate(uint32_t menu_va);   /* round 52 */
 void isaac_gl_quad_census(uint32_t *quad_draws, uint32_t *other_blocks, uint32_t *pattern);   /* round 53 */
 
+/* Round 95 (host_shims_eh.c): a C++ throw caught the way the image catches it.
+ * isaac_eh_plan walks the fs:[0] chain and the image's own EH tables without
+ * touching anything; isaac_eh_tail runs the ten catch continuations Ghidra did
+ * not make functions; isaac_eh_throw carries a catch out or returns untouched. */
+#define ISAAC_EH_NESTED 16
+typedef struct {
+    uint32_t node, ebp, funcinfo, handler, disp, adjectives, ptype, mdisp;
+    int32_t  state, try_low, try_high;
+    uint32_t n_nested;
+    uint32_t nested_node[ISAAC_EH_NESTED], nested_funcinfo[ISAAC_EH_NESTED];
+    int32_t  nested_state[ISAAC_EH_NESTED];
+} isaac_eh_plan_t;
+uint32_t isaac_eh_funcinfo(uint32_t handler);
+int  isaac_eh_plan(uint32_t fs0, uint32_t throwinfo, uint32_t esp_limit, isaac_eh_plan_t *p);
+int  isaac_eh_tail(uint32_t cont, isaac_cpu *c);
+void isaac_eh_throw(isaac_cpu *restrict cpu);
+
 #ifdef __cplusplus
 }
 #endif

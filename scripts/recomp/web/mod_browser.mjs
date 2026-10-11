@@ -379,6 +379,12 @@ export function createModBrowser(opts) {
     const meta = [it.version ? `VERSION ${it.version}` : '', it.bytes ? mib(it.bytes) : ''].filter(Boolean).join('    ');
     text(F10, clip(F10, meta, width), d.x0, y, 'light');
     y += 16;
+    // round 95: the mods it needs, which installing it brings along
+    if (it.requires && it.requires.length) {
+      const req = wrapText(`REQUIRES ${it.requires.join(', ').toUpperCase()}`, width, (t) => measure(F10, t), 2);
+      req.forEach((line, i) => text(F10, line, d.x0, y - 2 + i * 12, 'light'));
+      y += req.length * 12;
+    }
     rect(d.x0, y, width, 1, HILITE);
     y += 7;
     const actionY = d.py + dh - 62;
@@ -411,7 +417,9 @@ export function createModBrowser(opts) {
       const pct = s.progress != null ? s.progress : 100;
       frame(d.x0, actionY + 2, width, 12, INK);
       rect(d.x0 + 2, actionY + 4, Math.round((width - 4) * pct / 100), 8, LIGHT);
-      text(F10, s.phase === 'unpack' ? 'UNPACKING...' : `DOWNLOADING  ${pct}%`, d.x0, actionY + 18);
+      const of = s.step ? `${s.step.at} OF ${s.step.of}  ` : '';
+      text(F10, clip(F10, s.phase === 'unpack' ? `${of}UNPACKING...` : `${of}DOWNLOADING  ${pct}%`, width), d.x0, actionY + 18);
+      if (s.step) text(F10, clip(F10, s.step.name.toUpperCase(), width - backW - 12), d.x0, actionY + 30, 'light');
     } else if (it.installed) {
       const done = s.fresh && s.fresh.has(it.id);
       tick(d.x0, actionY + 7);
