@@ -8922,3 +8922,96 @@ pages (tboi.online and GitHub Pages) name it at a pinned commit, `@<sha>/mods`
 rather than `@main`. A part keeps its name when its mod changes, and
 jsDelivr holds a branch path for up to 7 days, so a catalogue update is a
 page update, like the streams. The VPS serves no mod bytes now.
+
+### 21.122 Round 96: a call without EIP and FS_OFFSET, and the host's part of the memory measured
+
+**Where a busy frame goes, once more.** Round 94's profile is flat: no lifted
+function above 3%. So the cost is spread across every function, in what the lifter
+emits at every call. There are 131,789 call sites. Each one stores every register
+local of its function into `CpuState` before the call and loads them back after.
+Two of those never needed it:
+
+- `EIP`. The lifted code never reads the local: it is only assigned
+  (`EIP = MEMR32(ESP)` at a ret) and spilled. The host reads `s->EIP` only
+  after setting it itself (the longjmp resume) or to print a trap.
+- `FS_OFFSET`. Read-only in lifted code; it is the TEB base for `fs:`
+  addressing. The host sets it when it creates a `CpuState`, and nothing writes
+  it after, so the reload returns what the local already holds.
+
+`lift_patches.apply_call_slim` deletes the standalone spill and reload lines of
+those two registers: 566,340 lines in 38 TUs. The entry declarations stay (clang
+drops them), and so do the one-line continuation exits. The pass runs last in
+`build_boot.py`, after `split_giants`, because a block patch's old text may hold
+those lines. It refuses the tree if any lifted line uses either register any
+other way; the allowed forms are listed in `SLIM_ALLOWED`. `ISAAC_CALL_SLIM=0`
+skips it. `tests/recomp-call-slim.test.js` pins the pass (LF and CRLF, nothing
+else moves, the violations, the refusal); 6 mutants were killed.
+
+| | r13 | r96 |
+|---|---|---|
+| boot.wasm | 58,442,811 B | **54,538,638 B** (-6.7%) |
+| boot.wasm, gzip -9 | 12,145,149 B | **11,691,010 B** |
+| stream A stored | 24,128,971 B | **23,676,543 B** |
+
+`heavy-bench.mjs --still`: stage 8, 16 items, 18 Hosts, CPU x4, 25 s. Four
+interleaved pairs on one machine, both builds served at the VPS's routes:
+
+| pair | r13 ms/tick | r96 ms/tick |
+|---|---|---|
+| a | 30.38 | 29.63 |
+| b | 30.06 | 28.60 |
+| c | 31.14 | 31.01 |
+| d | 29.74 | 28.99 |
+| mean | 30.33 | **29.56** (-2.5%) |
+
+Every pair favours r96. Displayed fps averaged 40.5 against 42.9. Pair c ran
+while the machine was loaded, and both builds were slow in it.
+
+**The host's 256 MiB, measured.** The wasm memory is the guest map below
+`0x1c000000` plus the host's part above it. Nothing had measured the host's
+part. Fresh wasm memory is zero, and the allocator never re-zeroes, so the
+highest non-zero byte above the host base bounds what the host has ever
+touched (`heavy-bench.mjs --hostheap`, `host-heap.mjs`):
+
+| | host top | touched pages | memory |
+|---|---|---|---|
+| r13, title, frame 716 | 117.0 MiB | 101.5 MiB | 704 MiB |
+| r13, stage-8 scene, after 20 s | 128.0 MiB | 112.6 MiB | 704 MiB |
+| r96, stage-8 scene | 128.0 MiB | 112.6 MiB | 640 MiB |
+
+Release 13 never grew. `-sINITIAL_MEMORY` is **640 MiB** now (was 704): the host
+gets 192 MiB, 64 over its measured peak. Growth was already allowed and stays
+allowed; it has to be. Enabled mods are seeded into the host heap under both of
+the engine's mod roots, so each file is held twice, and the page seeds up to 96 MB
+of mod files. A big mod set grew the memory on r13 too.
+
+Growing works. A build that starts at 560 MiB grew to 656.9 MiB during the boot and
+played the stage-8 scene with no error. The page keeps no heap view across a
+call: every page and EM_JS access re-reads `HEAPU8`. A grown memory measured a
+little slower in both of its pairs (29.56/30.24 against 29.27/28.14 ms per
+tick), so growth is a safety net, not the plan. The guest arena stays at 384 MiB:
+one catalogue mod (Encyclopedia) already needs more than that (21.121).
+
+**Checked on the r96 candidate** (release 13's pages with only the engine
+changed; stream A re-cut on a new route): live-proof, `sound-check.mjs`,
+`lua-check.mjs` (the require error is formatted), `pad-check.mjs` 8/8,
+`run-start.mjs`, and `transition-check.mjs` at x6 (42 shots, no error). The
+recomp suites touched by the change pass 67/67.
+
+**Looked at and left.**
+
+- **Brotli for stream A.** The engine is 12.1 MB under gzip -9, 8.3 MB under
+  Brotli 11 and 7.9 MB under xz. Chromium 151's `DecompressionStream` takes
+  neither `brotli` nor `zstd`, though. The chunks are scrambled, so HTTP-level
+  encoding cannot apply either. That leaves a decoder in the page, which every
+  boot would pay, a returning player's cached boot included, to save ~4 MB once
+  per engine.
+- **The duplicated mod seeds.** Sharing one buffer between the two roots needs
+  copy-on-write in the RAM-FS: a write reallocates `e->data`, and a delete frees
+  it. That is a host change of its own, and the next memory item for mod
+  players.
+- **The next step of this round.** The callee-saved registers (EBX, ESI, EDI,
+  EBP) are reloaded after every call too. Skipping that is sound only for
+  callees proven to restore them on every path, and MSVC's /LTCG can give a
+  static function a custom convention. That needs a per-callee proof from the
+  p-code, not a text pass.

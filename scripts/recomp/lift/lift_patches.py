@@ -1531,6 +1531,77 @@ def apply_entry_first(lift_dir: Path, check_only: bool = False) -> list[Path]:
     return touched
 
 
+# --- the call boundary without EIP and FS_OFFSET (round 96) ----------------
+# Every call site stores the function's register locals into CpuState and
+# reloads them after (131,789 sites). Two of those registers never need it:
+#
+#   EIP        the local is only ever stored: `EIP = MEMR32(ESP)` at a ret and
+#              `s->EIP = EIP` / `EIP = s->EIP` in spills. Nothing in the lifted
+#              code reads it, and the host reads s->EIP only after setting it
+#              itself (the longjmp resume) or to print a trap.
+#   FS_OFFSET  read-only in lifted code (the TEB base for fs: addressing). The
+#              host sets it when it creates a CpuState and nothing writes it
+#              after, so a reload returns the value the local already holds.
+#
+# The pass deletes the standalone spill and reload lines of those two (the
+# entry `uint32_t EIP = s->EIP;` declarations stay; clang drops them). The
+# one-line continuation exits are left alone. It runs after every other
+# patch, because a block patch's old text may contain these lines; applied
+# patches are found by their marker, so the deletion inside them is harmless.
+# It refuses to run if any lifted line uses either register in another way.
+# ISAAC_CALL_SLIM=0 skips it (the rewrite is in place: use a fresh tree).
+SLIM_LINE = re.compile(rb"^[ \t]*(?:s->EIP = EIP;|EIP = s->EIP;|s->FS_OFFSET = FS_OFFSET;|FS_OFFSET = s->FS_OFFSET;)[ \t]*\r?\n", re.M)
+SLIM_REG = re.compile(rb"\b(?:EIP|FS_OFFSET)\b")
+SLIM_ALLOWED = re.compile(
+    rb"s->EIP = EIP;|EIP = s->EIP;|s->FS_OFFSET = FS_OFFSET;|FS_OFFSET = s->FS_OFFSET;"
+    rb"|uint32_t (?:EIP|FS_OFFSET) = s->(?:EIP|FS_OFFSET);|\bEIP = MEMR32\(ESP\);|s->EIP = MEMR32\(s->ESP\);"
+    rb"|\(uint32_t\)\(FS_OFFSET \+ \(\(uint32_t\)0x[0-9a-f]+u\)\)")
+
+
+def slim_violations(text: bytes) -> list[bytes]:
+    """Lines that use EIP or FS_OFFSET other than as a spill, a reload, an
+    entry declaration, a ret's `EIP = MEMR32(ESP)` or an fs: address."""
+    bad = []
+    for line in text.splitlines():
+        if not SLIM_REG.search(line):
+            continue
+        code = line.split(b"/*", 1)[0]
+        if SLIM_REG.search(SLIM_ALLOWED.sub(b"", code)):
+            bad.append(line.strip())
+    return bad
+
+
+def slim_call_text(text: bytes) -> tuple[bytes, int]:
+    return SLIM_LINE.subn(b"", text)
+
+
+def apply_call_slim(lift_dir: Path, check_only: bool = False) -> list[Path]:
+    """Drop the EIP and FS_OFFSET spill/reload lines from every TU. Returns
+    the TUs modified (their objects recompile by source hash)."""
+    import os
+    if os.environ.get("ISAAC_CALL_SLIM") == "0":
+        print("call-slim: skipped (ISAAC_CALL_SLIM=0)")
+        return []
+    touched: list[Path] = []
+    total = 0
+    for tu in sorted(lift_dir.glob("lifted_*.c")):
+        raw = tu.read_bytes()
+        bad = slim_violations(raw)
+        if bad:
+            raise SystemExit("call-slim: %s uses EIP/FS_OFFSET outside a spill: %s"
+                             % (tu.name, b" | ".join(bad[:3]).decode(errors="replace")))
+        new, n = slim_call_text(raw)
+        if not n:
+            continue
+        total += n
+        touched.append(tu)
+        if not check_only:
+            tu.write_bytes(new)
+    print("call-slim: %d EIP/FS_OFFSET spill or reload line(s) %s in %d TU(s)"
+          % (total, "to drop" if check_only else "dropped", len(touched)))
+    return touched
+
+
 def find_function(text: str, name: str) -> tuple[int, int] | None:
     """Return (start, end) of `void <name>(CpuState *restrict s) { ... }` at
     column 0, matching the closing brace at column 0 (the lifter's layout)."""
@@ -1596,6 +1667,7 @@ def main() -> int:
         return 0
     touched = apply_lift_patches(args.dir, check_only=args.check)
     touched += apply_purge_patches(args.dir, check_only=args.check)
+    touched += apply_call_slim(args.dir, check_only=args.check)
     if args.check:
         return 1 if touched else 0
     return 0

@@ -135,7 +135,14 @@ LDFLAGS = [
     # 0x24000000 and this is 832 MiB instead of 1088. Override with
     # --initial-memory. MAXIMUM_MEMORY lifts the 2 GiB growth ceiling wasm32
     # gets by default.
-    "-sINITIAL_MEMORY=738197504",
+    # Round 96: the host's own part is 192 MiB now, not 256. Its touched
+    # high-water mark (the highest non-zero byte above the host base, read
+    # from the page: heavy-bench.mjs --hostheap) is 117 MiB at the title and
+    # 128 MiB in the stage-8 scene with 16 items and 18 Hosts; release 13 never
+    # grew. A larger need (many mods: their files are seeded into the host
+    # heap) grows the memory, which the page survives (measured from 560 MiB:
+    # it grew to 657 and played), at a few per cent of frame time.
+    "-sINITIAL_MEMORY=671088640",
     "-sMAXIMUM_MEMORY=4294967296",
     "-sALLOW_MEMORY_GROWTH=1",
     "-sGLOBAL_BASE=469762048",
@@ -324,6 +331,10 @@ def main():
         # for a 338,000-line function.
         from split_giants import apply_split_giants  # noqa: E402
         patched |= set(apply_split_giants(lift_dir))
+        # Round 96: the EIP/FS_OFFSET spill and reload lines go last, after the
+        # passes whose old text may contain them (lift_patches.apply_call_slim).
+        from lift_patches import apply_call_slim  # noqa: E402
+        patched |= set(apply_call_slim(lift_dir))
         print("lift-patches: %d TU(s) rewritten" % len(patched))
 
     BOOT_OUT.mkdir(parents=True, exist_ok=True)

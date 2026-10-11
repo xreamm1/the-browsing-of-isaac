@@ -165,6 +165,16 @@ not its public fast-path wrapper. Split-function continuations dispatch
 through their owning trampoline so pending jumps cross parts correctly;
 function prototypes do not establish block ownership.
 
+The last lift patch drops the `EIP` and `FS_OFFSET` spill and reload lines
+from every call site (`lift_patches.apply_call_slim`). Lifted code never reads
+the `EIP` local, and never writes `FS_OFFSET`. The pass refuses a tree where
+either register is used any other way, and `ISAAC_CALL_SLIM=0` skips it. It
+rewrites the TUs in place, so build from a copy of the lift tree.
+
+The wasm memory starts at 640 MiB: the guest map below `0x1c000000`, then
+192 MiB for the host, whose measured peak is 128 MiB. A larger need, such as
+many mods, grows it.
+
 The unchanged-value path of `0x00a14c00` compares the first active matching
 uniform's latest payload using the incoming type's width. It performs no
 guest allocation or write. Changed values, missing entries, unsafe aliases,
