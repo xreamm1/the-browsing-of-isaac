@@ -129,6 +129,14 @@ double isaac_render_gate_wait_ms(void);
 double isaac_render_gate_carry_ms(void);
 double isaac_render_gate_pace_ms(double now_ms);
 uint32_t isaac_render_gate_intervals(int cls, double *mean_ms, double *max_ms);
+/* Round 94: a sliced job asleep until wake_ms sits out a frame at now_ms. */
+int isaac_threads_napping(double wake_ms, double now_ms);
+static void test_thread_naps(void) {
+    check(!isaac_threads_napping(0.0, 100.0), "thread naps: a job that never slept runs every frame");
+    check(isaac_threads_napping(150.0, 100.0), "thread naps: a job whose Sleep ends at 150 sits out the frame at 100");
+    check(!isaac_threads_napping(100.0, 100.0), "thread naps: and runs on the frame its sleep ends");
+    check(!isaac_threads_napping(99.5, 100.0), "thread naps: or any frame after");
+}
 static void test_render_gate(void) {
     isaac_render_gate_reset();
     check(isaac_render_gate_decide(0.0, 0, 0u) == 0, "render gate: no Game, the frame is drawn");
@@ -333,6 +341,7 @@ static int selftest_fs_read_is(uint32_t scratch, const char *path,
 
 int main(int argc, char **argv) {
     test_render_gate();
+    test_thread_naps();
     printf("--- isaac host layer selftest ---\n");
     if (argc > 1) load_image(argv[1]);
 

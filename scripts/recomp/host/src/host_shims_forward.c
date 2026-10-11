@@ -464,7 +464,9 @@ void imp_kernel32__Sleep(CpuState *restrict cpu) {
         g_qpc_ticks += (uint64_t)ms * (ISAAC_QPF_HZ / 1000ull);
     cpu->EAX = 0;
     sleep_yield_web(ms);                     /* interactive pacing (round 25) */
-    /* a sliced thread job sleeping is a thread job done for this frame (round 24) */
+    /* a sliced thread job sleeping is a thread job done for this frame (round 24),
+     * and done until its sleep is over (round 94) */
+    { extern void isaac_threads_sleep(uint32_t ms); isaac_threads_sleep(ms); }
     { extern void isaac_threads_yield(void); isaac_threads_yield(); }
 }
 

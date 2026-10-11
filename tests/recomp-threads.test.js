@@ -79,3 +79,23 @@ test('a wait on a thread handle joins the job: its slices run until the loop ret
   assert.ok(joinAt > 0 && joinAt < wait.indexOf('if (o->signaled) {'), 'WaitForSingleObject joins a thread handle before testing the signal');
   assert.ok(mod.includes('static void slice_job(unsigned i, CpuState *restrict cpu) {'), 'the per-frame runner and the join share one slice body');
 });
+
+test('round 94: a sliced job\'s Sleep is a wake time in interactive mode; the frame skips it until then', () => {
+  const mod = readFileSync(join(host, 'host_shims_module.c'), 'utf8');
+  const fwd = readFileSync(join(host, 'host_shims_forward.c'), 'utf8');
+  const sleep = fwd.slice(fwd.indexOf('void imp_kernel32__Sleep(CpuState *restrict cpu) {'));
+  const at = sleep.indexOf('isaac_threads_sleep(ms); }');
+  assert.ok(at > 0 && at < sleep.indexOf('isaac_threads_yield(); }'), 'Sleep reports its duration before the slice yields');
+  const fn = mod.slice(mod.indexOf('void isaac_threads_sleep(uint32_t ms) {'));
+  assert.ok(/#ifdef ISAAC_WEB\s*extern int isaac_web_yield_enabled\(void\);\s*if \(g_slicing && isaac_web_yield_enabled\(\)\)\s*g_thr\[g_slice_cur\]\.wake_ms = emscripten_get_now\(\) \+ \(double\)ms;\s*#else\s*\(void\)ms;\s*#endif/.test(fn),
+    'only an interactive (wall-clock) slice records a wake time; deterministic runs keep one slice per frame');
+  assert.ok(mod.includes('int isaac_threads_napping(double wake_ms, double now_ms) { return wake_ms > now_ms; }'), 'the decision');
+  const slice = mod.slice(mod.indexOf('void isaac_threads_slice(CpuState *restrict cpu) {'));
+  const body = slice.slice(0, slice.indexOf('\n}'));
+  assert.ok(/if \(isaac_threads_napping\(g_thr\[i\]\.wake_ms, now\)\) \{[^]*?continue;\s*\}\s*slice_job\(i, cpu\);/.test(body), 'a napping job sits the frame out');
+  const job = mod.slice(mod.indexOf('static void slice_job(unsigned i, CpuState *restrict cpu) {'));
+  const reset = job.indexOf('g_thr[i].wake_ms = 0.0;');
+  assert.ok(reset > 0 && reset < job.indexOf('if (setjmp(g_slice_jmp) == 0) {'), 'each slice clears the wake: a yield that is not a Sleep runs next frame');
+  const joinFn = mod.slice(mod.indexOf('int isaac_threads_join(uint32_t h, CpuState *restrict cpu) {'));
+  assert.ok(!joinFn.slice(0, joinFn.indexOf('\n}')).includes('napping'), 'a join still slices the job back to back, asleep or not');
+});

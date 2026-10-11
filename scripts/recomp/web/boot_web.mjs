@@ -86,7 +86,7 @@ const cfg = {
 // The game polls XInput for four slots (host_shims_xinput.c); the page answers
 // from the browser's Gamepad API (gamepad.mjs) and plays the game's rumble on the
 // pad. A browser shows a pad to the page once one of its buttons is pressed.
-const pads = createPads(() => (typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : []), { memoMs: 2 });
+const pads = createPads(() => (typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : []), { memoMs: 2, idleMs: 500 });
 // a page menu that has the pad (play.mjs: EDIT FILE, the mods menus) shows the game a resting one
 const padGates = [createPadGate(), createPadGate(), createPadGate(), createPadGate()];
 cfg.isaacPadState = (slot) => {
@@ -97,8 +97,8 @@ window.isaacPadReader = pads;
 cfg.isaacPadRumble = (slot, left, right) => { rumble(pads.pad(slot), left, right); };
 window.isaacPads = () => ({ count: pads.count(), slots: [0, 1, 2, 3].map((i) => pads.state(i)) });
 if (typeof window.addEventListener === 'function') {
-  window.addEventListener('gamepadconnected', (e) => log(`[pad] ${e.gamepad.id} connected (browser pad ${e.gamepad.index})`));
-  window.addEventListener('gamepaddisconnected', (e) => log(`[pad] ${e.gamepad.id} disconnected`));
+  window.addEventListener('gamepadconnected', (e) => { pads.wake(); log(`[pad] ${e.gamepad.id} connected (browser pad ${e.gamepad.index})`); });
+  window.addEventListener('gamepaddisconnected', (e) => { pads.wake(); log(`[pad] ${e.gamepad.id} disconnected`); });
 }
 let lazyReads = 0, lazyBytes = 0;
 const lazyByFile = new Map();                              // src -> bytes (round 40: what the run start reads)

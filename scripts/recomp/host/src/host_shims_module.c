@@ -488,14 +488,26 @@ void imp_kernel32__SetThreadPriority(CpuState *restrict cpu) {
  * normally through the trampoline and is retired.
  *
  * ISAAC_THREADS=0 turns slicing off (the old behaviour: jobs adopted, marked
- * done, never run). */
+ * done, never run).
+ *
+ * Round 94: in interactive mode a job's Sleep(ms) is a wake time. The frame
+ * skips the job's slice until it is over, as the thread it stands for would
+ * still be asleep. The 100 ms poller (0x00a220c0: XInput capabilities, then
+ * Sleep(100)) had run on every frame, six times its rate, and that cost 1.2%
+ * of a busy frame at CPU x4. The audio thread's Sleep(5) is shorter than a
+ * frame, so it still runs on every one. Deterministic runs (node) keep one
+ * slice per frame, because their clock is not the wall. */
 #include <setjmp.h>
+#ifdef ISAAC_WEB
+#include <emscripten.h>
+#endif
 #define THR_MAX 16
 static struct {
     uint32_t start, arglist, fn, arg, handle;
     uint32_t entry, entry_arg, tobj;      /* what a slice enters, and the Thread struct to mark done */
     int ran, retired;
-    unsigned slices, yields;
+    unsigned slices, yields, naps;
+    double wake_ms;                       /* round 94: no slice before this (0: every frame) */
 } g_thr[THR_MAX];
 static unsigned g_thr_n;
 static int g_thr_running;                 /* the round-12 inline runner */
@@ -522,6 +534,21 @@ static int slice_mode(void) {             /* 1 = slices (default), 0 = ISAAC_THR
 }
 
 int isaac_threads_slicing(void) { return g_slicing; }
+
+/* Round 94: whether a job asleep until wake_ms sits out a frame at now_ms.
+ * A job that never slept (wake 0) or whose sleep is over runs. */
+int isaac_threads_napping(double wake_ms, double now_ms) { return wake_ms > now_ms; }
+
+/* The Sleep shim reports the sliced job's sleep here before it yields. */
+void isaac_threads_sleep(uint32_t ms) {
+#ifdef ISAAC_WEB
+    extern int isaac_web_yield_enabled(void);
+    if (g_slicing && isaac_web_yield_enabled())
+        g_thr[g_slice_cur].wake_ms = emscripten_get_now() + (double)ms;
+#else
+    (void)ms;
+#endif
+}
 
 /* Abandon the current slice. Only meaningful inside one; elsewhere a no-op,
  * so the yield sites need no guard of their own. */
@@ -595,6 +622,7 @@ static void slice_job(unsigned i, CpuState *restrict cpu) {
         sub.ESP -= 4; isaac_w32(sub.ESP, 0);                  /* return address */
         g_slicing = 1;
         g_slice_cur = i;
+        g_thr[i].wake_ms = 0.0;               /* a yield other than Sleep: next frame again */
         g_slice_cs_last = 0u;
         g_slice_cs_repeat = 0u;
         if (g_thr[i].slices == 0u)
@@ -626,8 +654,19 @@ static void slice_job(unsigned i, CpuState *restrict cpu) {
 void isaac_threads_slice(CpuState *restrict cpu) {
     if (!slice_mode() || g_slicing || !cpu) return;
     ++g_slice_frames;
+#ifdef ISAAC_WEB
+    double now = emscripten_get_now();
+#else
+    double now = 0.0;                         /* wake times are only set in interactive mode */
+#endif
     for (unsigned i = 0; i < g_thr_n; ++i) {
         if (g_thr[i].retired) continue;
+        if (isaac_threads_napping(g_thr[i].wake_ms, now)) {
+            if (++g_thr[i].naps == 1u)
+                isaac_log("[isaac][thr] job #%u 0x%08x(0x%08x) sleeps between slices (its Sleep is honoured)",
+                          i, g_thr[i].entry, g_thr[i].entry_arg);
+            continue;
+        }
         slice_job(i, cpu);
     }
 }

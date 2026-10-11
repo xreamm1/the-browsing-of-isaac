@@ -8721,3 +8721,100 @@ of 15 ms or more yields through a MessageChannel instead of waiting for the
 animation frame. Chromium also runs a late frame's rAF as soon as the main
 thread frees. So two passes can share one vsync. The gate does not change
 this (x4: 31.0 against 29.7-31.7 off).
+
+### 21.120 Round 94: three costs the original never paid
+
+A fresh x4 profile of the stage-8 scene (heavy-bench `--still --profile`,
+release 11) is flat. Its top line is `(program)` at 10.6%, and no lifted
+function is above 3%. `prof-under.mjs` showed that **8% of all time ran
+inside the guest thread slices**. Three of the costs below are host-side and
+none of them exist natively.
+
+**The 100 ms poller ran every frame.** `0x00a220c0` loops on
+`[0xc57b1c] & 2`. Each pass calls `0x00a6dab0` (XInputGetCapabilities for the
+four slots) and then `Sleep(100)` (`push 0x64` at `0x00a220dc`). A slice
+yields at Sleep, and the next frame re-enters the loop from the top. So the
+poller ran 60 times a second instead of 10. That cost 1.2% of a busy frame,
+half of it in `navigator.getGamepads()`.
+
+The Sleep shim now reports the duration first (`isaac_threads_sleep`). In
+interactive mode the job gets a wake time, and `isaac_threads_slice` skips it
+until then (`isaac_threads_napping`, driven by the selftest). Every slice
+clears the wake, so a yield that is not a Sleep (a wait, an idle lock lap)
+still runs the job next frame. A join slices back to back, asleep or not.
+Deterministic runs keep one slice per frame: their clock is not the wall.
+
+The audio thread (`0x00a7da80`, `Sleep(5)` at `0x00a7daa8`) still runs every
+frame, and naps only when two slices fall inside 5 ms (a render-gate skip).
+Result: poller 1.2% -> 0.07%, music continuous at x6.
+
+**The page read the Gamepad API every frame for no pad.** With no pad
+connected, `createPads` now holds an empty read for `idleMs` (500 ms).
+`gamepadconnected` and `gamepaddisconnected` call `wake()`. With a pad, the
+hold stays at 2 ms per frame.
+
+- `getGamepads`: 0.4% -> 0.02%.
+- A pad appearing with no event is seen by the page in 314-436 ms, and the
+  game logs it at 437 ms (release 11: 64 ms).
+- With the event, the page sees it in 3 ms.
+- `pad-check.mjs` passes 8/8.
+
+**The footstep's readback drained the GPU.** decomp-scout traced the 1x1
+`glReadPixels`:
+
+- Path: `Entity_Player`'s footstep code `0x007b8cb0`, gated by
+  `IsFootstepFrame` (`0x007b9940`, `[Game+0x264f8] % 6`), through the
+  renderer's GetPixel (vtable slot 0x2c, `0x00a69700` -> `0x00a69760`).
+- The colour only reaches the footprint colour (`SetFootprintColor`
+  `0x007b98c0`, each sample blended halfway in) and the player sprite's tint
+  (`0x00794e50`).
+- No branch, RNG draw, spawn or collision reads it (census of
+  `0x1828`/`0x1854`/`0x170c`).
+
+So a 1x1 RGBA read now answers with the newest completed read and starts the
+next one into a pixel-pack buffer behind a fence (`rp_harvest`/`rp_issue`, a
+ring of 4). Only the first read still waits. The colour served is the
+previous footstep's, 6 ticks old.
+
+`ISAAC_READPIXELS_CHECK=1` logs each served value next to a synchronous read
+at the same instant:
+
+    readback check 20 at 221,208: served 115,65,54,255, now 115,65,54,255
+    readback check 21 at 221,143: served 115,65,54,255, now 101,12,14,255
+    readback check 22 at 221,143: served 101,12,14,255, now 101,12,14,255
+
+That is exactly one sample of lag. A WebGL trace shows each buffer written,
+fenced, found signalled at the next footstep (~200 ms later), read back and
+only then reused. Chrome still prints "READ-usage buffer was written, then
+fenced, but written again before being read back" for about a quarter of the
+reads; the sequence does not explain it. `getBufferSubData` costs 0.2-0.3%,
+against 1.0-1.2% for `readPixels`. `ISAAC_READPIXELS_SYNC=1` restores the
+synchronous read.
+
+**Measured** (heavy-bench `--still`, interleaved pairs on one server):
+
+| | r11 | r12 |
+|---|---|---|
+| x4 ms per tick | 30.2 / 31.3 / 31.0 (mean 30.8) | 29.3 / 28.9 / 28.1 (mean 28.8) |
+| x4 displayed fps | 42.0 / 35.3 / 40.1 | 45.2 / 45.9 / 49.7 |
+| x6 ms per tick, 5 pairs | mean 47.9 | mean 43.8 |
+| x6 ticks/s, 5 pairs | mean 21.4 | mean 23.2 |
+
+x4 is 6.5% less CPU per tick and about 20% more frames shown: the drain cost
+more than its own samples. x6 is noisier (the pairs alternate by up to 10 ms)
+but favours r12 on the mean.
+
+Also checked on r12:
+
+- `sound-check.mjs` passes.
+- `live-proof.mjs` passes.
+- Three door transitions at x6 render cleanly; the dark room's tint reaches
+  the player.
+
+**Looked at and left.** The vertex ring sends 19.7 KB a frame in 59.5 draws,
+exactly what the quads need; the "4.7 MB a frame" in 21.118's note is stale.
+The uniform/attribute location cache (0.8%) is already a hash table; a
+memo keyed on the name's address would need the names to be immutable, which
+is not established. The audio thread's remaining 5.7% is stb_vorbis decoding real
+music (residue `0x00aa2580`, codebook `0x00aa44d0`), the open item from
+rounds 49-50.

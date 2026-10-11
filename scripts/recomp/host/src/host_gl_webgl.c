@@ -466,10 +466,100 @@ EM_JS(void, isaac_readpixels_stack_js, (int x, int y, int w, int h), {
     err("[isaac][gl] glReadPixels " + w + "x" + h + " at " + x + "," + y + " from: " + st);
 });
 static uint32_t g_rp_logged;
+/* Round 94: the game's one readback, made asynchronous. On a footstep frame
+ * (Entity_Player::IsFootstepFrame 0x007b9940, every 6 ticks, from 0x007b8cb0)
+ * the player samples one RGBA pixel under itself through the renderer's
+ * GetPixel (vtable slot 0x2c: 0x00a69700 -> 0x00a69760). The colour feeds
+ * only the footprint colour and the player sprite's tint (SetFootprintColor
+ * 0x007b98c0, each sample blended halfway in); no branch, RNG draw, spawn or
+ * collision reads it (decomp-scout census of 0x1828/0x1854/0x170c).
+ *
+ * A synchronous glReadPixels drains the GPU pipeline. That was 1.1% of a busy
+ * frame at CPU x4 on a desktop GPU, and on a phone's tiled GPU it is a whole
+ * flush. A 1x1 RGBA read now starts an asynchronous read into a pixel-pack
+ * buffer behind a fence, and answers with the newest read that has
+ * completed: the colour of the previous footstep, 6 ticks old. Only the
+ * first read, with nothing completed yet, still waits.
+ * ISAAC_READPIXELS_SYNC=1 keeps every read synchronous;
+ * ISAAC_READPIXELS_CHECK=1 also reads each pixel synchronously and logs the
+ * pair, so the lag can be seen. */
+/* WebGL2's getBufferSubData; Emscripten implements it, GLES3's gl3.h does not declare it */
+void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data);
+#define RP_RING 4
+static GLuint g_rp_pbo[RP_RING];
+static GLsync g_rp_fence[RP_RING];
+static unsigned g_rp_next;                    /* the slot written next: the oldest */
+static uint8_t g_rp_px[4];
+static int g_rp_have;
+static uint32_t g_rp_async, g_rp_waited;
+static int rp_mode(void) {                    /* 0 sync, 1 async, 2 async + a checking sync read */
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("ISAAC_READPIXELS_SYNC"), *c = getenv("ISAAC_READPIXELS_CHECK");
+        v = (s && *s && *s != '0') ? 0 : (c && *c && *c != '0') ? 2 : 1;
+    }
+    return v;
+}
+/* the reads that have completed, oldest first, so the newest is kept */
+static void rp_harvest(void) {
+    for (unsigned k = 0; k < RP_RING; ++k) {
+        unsigned s = (g_rp_next + k) % RP_RING;
+        if (!g_rp_fence[s]) continue;
+        GLenum st = glClientWaitSync(g_rp_fence[s], 0, 0);
+        if (st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, g_rp_pbo[s]);
+            glGetBufferSubData(GL_PIXEL_PACK_BUFFER, 0, 4, g_rp_px);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            g_rp_have = 1;
+        } else if (st != GL_WAIT_FAILED) {
+            continue;                             /* still on the GPU */
+        }
+        glDeleteSync(g_rp_fence[s]);
+        g_rp_fence[s] = 0;
+    }
+}
+static void rp_issue(GLint x, GLint y) {
+    unsigned s = g_rp_next;
+    g_rp_next = (g_rp_next + 1u) % RP_RING;
+    if (g_rp_fence[s]) { glDeleteSync(g_rp_fence[s]); g_rp_fence[s] = 0; }   /* four footsteps late: dropped */
+    if (!g_rp_pbo[s]) {
+        glGenBuffers(1, &g_rp_pbo[s]);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, g_rp_pbo[s]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, 4, NULL, GL_STREAM_READ);
+    } else {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, g_rp_pbo[s]);
+    }
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void *)0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    g_rp_fence[s] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+}
 GLFN(glReadPixels) {
     ENTER;
     isaac_glc_count_readpixels(A(0), A(1), A(2), A(3), A(4), A(4) == 0x1908u ? 4u : A(4) == 0x1907u ? 3u : 1u);   /* GL_RGBA / GL_RGB */
     if (g_rp_logged < 3u) { ++g_rp_logged; isaac_readpixels_stack_js((int)A(0), (int)A(1), (int)A(2), (int)A(3)); }
+    uint8_t *dst = (uint8_t *)AP(6);
+    if (rp_mode() && A(2) == 1u && A(3) == 1u && A(4) == GL_RGBA && A(5) == GL_UNSIGNED_BYTE && dst) {
+        rp_harvest();
+        if (g_rp_have) {
+            memcpy(dst, g_rp_px, 4);
+            rp_issue((GLint)A(0), (GLint)A(1));
+            if (++g_rp_async == 1u)
+                isaac_log("[isaac][gl] glReadPixels 1x1: answered from the previous read, the next one runs behind a fence "
+                          "(%u synchronous read(s) before)", g_rp_waited);
+            if (rp_mode() == 2 && g_rp_async <= 40u) {
+                uint8_t now[4];
+                glReadPixels((GLint)A(0), (GLint)A(1), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, now);
+                isaac_log("[isaac][gl] readback check %u at %d,%d: served %u,%u,%u,%u, now %u,%u,%u,%u",
+                          g_rp_async, (int)A(0), (int)A(1), dst[0], dst[1], dst[2], dst[3], now[0], now[1], now[2], now[3]);
+            }
+            RET0;
+        }
+        glReadPixels((GLint)A(0), (GLint)A(1), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+        memcpy(g_rp_px, dst, 4);
+        g_rp_have = 1;
+        ++g_rp_waited;
+        RET0;
+    }
     glReadPixels((GLint)A(0), (GLint)A(1), (GLsizei)A(2), (GLsizei)A(3), A(4), A(5), AP(6));
     RET0;
 }

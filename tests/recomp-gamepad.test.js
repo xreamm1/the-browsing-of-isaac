@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { xinputState, createPads, XI } from '../scripts/recomp/web/gamepad.mjs';
 
 const pad = (index, { buttons = {}, axes = [0, 0, 0, 0], connected = true } = {}) => ({
@@ -108,4 +109,41 @@ test('round 93: with memoMs, the slots of one frame share one Gamepad API read',
   const unmemo = createPads(() => { plain++; return list; });
   unmemo.state(0); unmemo.state(1);
   assert.equal(plain, 2, 'without memoMs every ask reads');
+});
+
+test('round 94: with no pad, a read holds for idleMs; wake() and a found pad end the hold', () => {
+  let reads = 0, t = 0;
+  let list = [];
+  const pads = createPads(() => { reads++; return list; }, { memoMs: 2, idleMs: 500, now: () => t });
+  assert.equal(pads.state(0), null);
+  t = 100; pads.state(0); pads.count();
+  t = 499; pads.state(3);
+  assert.equal(reads, 1, 'no pad: one read serves the next 500 ms, not just 2');
+  list = [pad(0, { buttons: { 0: 1 } })];
+  assert.equal(pads.state(0), null, 'a pad that appears inside the hold is not seen yet');
+  t = 500.5;
+  assert.equal(pads.state(0).buttons, XI.A, 'past idleMs it is');
+  assert.equal(reads, 2);
+  t = 501; pads.state(0);
+  t = 503; pads.state(0);
+  assert.equal(reads, 3, 'with a pad the hold is memoMs again');
+  list = [];
+  t = 506; pads.state(0);
+  assert.equal(reads, 4);
+  list = [pad(1, { buttons: { 1: 1 } })];
+  t = 507; assert.equal(pads.state(0), null, 'the pad went away: idle again');
+  pads.wake();
+  assert.equal(pads.state(0).buttons, XI.B, 'wake() reads at once (gamepadconnected)');
+  assert.equal(reads, 5);
+  const memoOnly = createPads(() => { reads++; return []; }, { memoMs: 2, now: () => t });
+  const before = reads;
+  memoOnly.state(0); t = 510; memoOnly.state(0);
+  assert.equal(reads - before, 2, 'without idleMs an empty read holds memoMs only');
+});
+
+test('round 94: the page wakes the pad reader on gamepadconnected and holds idle reads 500 ms', () => {
+  const page = readFileSync(new URL('../scripts/recomp/web/boot_web.mjs', import.meta.url), 'utf8');
+  assert.ok(page.includes('{ memoMs: 2, idleMs: 500 }'), 'the page reader holds an empty read 500 ms');
+  assert.ok(page.includes("window.addEventListener('gamepadconnected', (e) => { pads.wake();"), 'a connect wakes it');
+  assert.ok(page.includes("window.addEventListener('gamepaddisconnected', (e) => { pads.wake();"), 'so does a disconnect');
 });

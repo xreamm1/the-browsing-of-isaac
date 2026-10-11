@@ -43,18 +43,26 @@ export function xinputState(gp) {
 // memoMs (round 93): the game asks for each of its four slots, every frame, and each
 // ask was a navigator.getGamepads() -- 0.5% of a busy frame at CPU x4. Asks within
 // memoMs of the last real read share it; the page's menus see a pad at most that old.
-export function createPads(getGamepads, { memoMs = 0, now = () => performance.now() } = {}) {
+// idleMs (round 94): a read that found no pad holds for idleMs instead -- the game's
+// input thread still asked every frame, 0.55% of a busy frame at CPU x4 for a player
+// with no pad at all. wake() drops the memo; the page calls it on gamepadconnected,
+// so a pad is seen at once when the browser announces it and within idleMs otherwise.
+export function createPads(getGamepads, { memoMs = 0, idleMs = 0, now = () => performance.now() } = {}) {
   const packets = [0, 0, 0, 0], last = ['', '', '', ''];
   let memo = null, memoAt = -Infinity;
   const list = () => {
-    if (memo && memoMs > 0 && now() - memoAt < memoMs) return memo;
+    if (memo && (memoMs > 0 || idleMs > 0)) {
+      const hold = memo.length ? memoMs : Math.max(memoMs, idleMs);
+      if (hold > 0 && now() - memoAt < hold) return memo;
+    }
     let raw = [];
     try { raw = Array.from((getGamepads && getGamepads()) || []); } catch { raw = []; }
     memo = raw.filter((gp) => gp && gp.connected !== false).sort((p, q) => p.index - q.index).slice(0, 4);
-    memoAt = memoMs > 0 ? now() : -Infinity;
+    memoAt = memoMs > 0 || idleMs > 0 ? now() : -Infinity;
     return memo;
   };
   return {
+    wake() { memo = null; memoAt = -Infinity; },
     // slot -> { packet, buttons, lt, rt, lx, ly, rx, ry } or null (not connected)
     state(slot) {
       const gp = list()[slot | 0];

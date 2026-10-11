@@ -164,6 +164,30 @@ test('round 93: main\'s in-between render asks the render gate, and a skipped fr
   assert.ok(/int main\(int argc, char \*\*argv\) \{\s*test_render_gate\(\);/.test(st), 'the selftest drives the decision');
 });
 
+test('round 94: the footstep\'s 1x1 readback is answered from the previous read and the next one runs behind a fence', () => {
+  const gl = readFileSync(join(hostSrc, 'host_gl_webgl.c'), 'utf8');
+  const fn = gl.slice(gl.indexOf('GLFN(glReadPixels) {'));
+  const body = fn.slice(0, fn.indexOf('\n}') + 2);
+  assert.ok(body.includes('if (rp_mode() && A(2) == 1u && A(3) == 1u && A(4) == GL_RGBA && A(5) == GL_UNSIGNED_BYTE && dst) {'),
+    'only a 1x1 RGBA unsigned-byte read takes the asynchronous path');
+  assert.ok(/rp_harvest\(\);\s*if \(g_rp_have\) \{\s*memcpy\(dst, g_rp_px, 4\);\s*rp_issue\(\(GLint\)A\(0\), \(GLint\)A\(1\)\);/.test(body),
+    'with a completed read in hand: answer with it, then start the next');
+  assert.ok(/glReadPixels\(\(GLint\)A\(0\), \(GLint\)A\(1\), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, dst\);\s*memcpy\(g_rp_px, dst, 4\);\s*g_rp_have = 1;/.test(body),
+    'with none yet: the one synchronous read, kept as the answer to come');
+  assert.ok(body.trimEnd().endsWith('glReadPixels((GLint)A(0), (GLint)A(1), (GLsizei)A(2), (GLsizei)A(3), A(4), A(5), AP(6));\n    RET0;\n}'),
+    'any other read is synchronous, as before');
+  const issue = gl.slice(gl.indexOf('static void rp_issue(GLint x, GLint y) {'));
+  const ib = issue.slice(0, issue.indexOf('\n}'));
+  assert.ok(/glBindBuffer\(GL_PIXEL_PACK_BUFFER, g_rp_pbo\[s\]\);\s*\}\s*glReadPixels\(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, \(void \*\)0\);\s*glBindBuffer\(GL_PIXEL_PACK_BUFFER, 0\);\s*g_rp_fence\[s\] = glFenceSync\(GL_SYNC_GPU_COMMANDS_COMPLETE, 0\);/.test(ib),
+    'the read goes into a pixel-pack buffer, the binding is restored, and a fence follows it');
+  const harvest = gl.slice(gl.indexOf('static void rp_harvest(void) {'));
+  const hb = harvest.slice(0, harvest.indexOf('\n}'));
+  assert.ok(hb.includes('unsigned s = (g_rp_next + k) % RP_RING;') && hb.includes('GLenum st = glClientWaitSync(g_rp_fence[s], 0, 0);'),
+    'completed reads are collected oldest first without waiting, so the newest wins');
+  assert.ok(/glGetBufferSubData\(GL_PIXEL_PACK_BUFFER, 0, 4, g_rp_px\);\s*glBindBuffer\(GL_PIXEL_PACK_BUFFER, 0\);/.test(hb), 'and copied out of the buffer');
+  assert.ok(gl.includes('v = (s && *s && *s != \'0\') ? 0 : (c && *c && *c != \'0\') ? 2 : 1;'), 'ISAAC_READPIXELS_SYNC=1 restores the synchronous read');
+});
+
 test('round 40: the module is served cacheably and instantiated from the fetch itself, so V8 keeps its optimised code across visits', () => {
   const r = readFileSync(join(root, 'scripts', 'recomp', 'web', 'run_web.mjs'), 'utf8');
   assert.ok(r.includes("const whole = r.file && !u.searchParams.has('off') && !b64;"), 'whole files get a validator');
