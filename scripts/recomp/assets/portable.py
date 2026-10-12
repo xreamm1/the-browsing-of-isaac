@@ -232,10 +232,14 @@ def plan(dist: str, skip: set[str]) -> list[dict]:
     return out
 
 
-def _recipe_windows(windowed: list[dict], b_len: int, rels: list[str]):
+def _recipe_windows(windowed: list[dict], b_len: int, rels: list[str], vorbis: float | None = None,
+                    source: dict | None = None):
     """window index -> recipe bytes for the windows of the named version-0 archives (None
     for every other window). Files are window-aligned (lay_out), so a window belongs to one
-    file; its tail past the file's end is the zero padding before the next one."""
+    file; its tail past the file's end is the zero padding before the next one.
+    Round 96d: `vorbis` (a libvorbis quality) codes their sound as Vorbis, and `source`
+    (rel -> path) reads an archive from a copy with the same layout (the untrimmed one,
+    so a lossy code is not stacked on the near-lossless trim)."""
     if not rels:
         return None
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -247,7 +251,7 @@ def _recipe_windows(windowed: list[dict], b_len: int, rels: list[str]):
     spans = []
     for f in windowed:
         if f["rel"] in want:
-            arch = R.V0Archive(f["path"])
+            arch = R.V0Archive((source or {}).get(f["rel"], f["path"]))
             if arch.size != f["size"]:
                 raise SystemExit("%s: archive is %d bytes, the layout says %d" % (f["rel"], arch.size, f["size"]))
             spans.append((f["at"], f["size"], arch, R._KeyCache()))
@@ -259,7 +263,7 @@ def _recipe_windows(windowed: list[dict], b_len: int, rels: list[str]):
                 lo = start - at
                 hi = min(size, lo + WINDOW)
                 tail = min(WINDOW, b_len - start) - (hi - lo)
-                return R.window_recipe(arch, arch.a.buf, lo, hi, keys, tail)
+                return R.window_recipe(arch, arch.a.buf, lo, hi, keys, tail, vorbis=vorbis)
         return None
     return recipe_for
 

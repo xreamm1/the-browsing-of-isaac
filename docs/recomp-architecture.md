@@ -9094,3 +9094,103 @@ for the cache. The second visit's frame 60 came ~1.1 s earlier in both setups
 alike, which is the warm machine, not the cache. Not shipped, and nothing changes
 in the page. A module split into separately cached parts is the only way left,
 and that is a different project.
+
+### 21.125 Round 96d: the sound effects as Vorbis, decoded by the browser
+
+**The bytes.** A cold boot fetched about 100 MB of stream B before the title,
+and 82.7 MB of that was the sound catalogue. The game preloads that catalogue,
+and it shipped near-lossless (rounds 67, 75 and release 9). The player chose
+Vorbis q4. A census of 200 of the 1,724 WAVs, against their PCM, priced the
+codecs:
+
+| codec | size |
+|---|---|
+| Opus 64k | 9.2% |
+| Vorbis q4 | 11.9% |
+| Opus 96k | 13.5% |
+| Vorbis q6 | 15.6% |
+
+Unlike Opus, Vorbis keeps each sound's own rate, so nothing is resampled.
+
+**The format.** Recipe version 2 (`recipe.js` header, `recipe.py`):
+
+- `"RW" 2` adds a head table to the window. libvorbis writes the same three
+  headers for one (channels, rate, quality), measured on every sound, so a
+  window carries each 3.3-3.5 KB set once.
+- Part kind 3 carries a share of a sound as Vorbis packets, LEB128-framed. It
+  is coded with up to 2,048 frames of the sound before the share as context,
+  dropped by the decoder. After the share always come 2,048 frames: the
+  sound's own, or silence past its end. Shares cut at a window edge therefore
+  join as the sound did. And the ffmpeg CLI's trim to the last granule, half a
+  short block early (128 frames at 44.1 kHz, 256 at 22.05), can never reach
+  the share.
+- The page decodes the packets with WebCodecs `AudioDecoder` (`vorbis`, the
+  Xiph-laced headers as the description). A version-2 recipe therefore
+  returns a Promise. Version 1 is unchanged and stays synchronous.
+- Decoded samples are rounded and clamped to 16 bits. Each entry is permuted
+  and XORed only once all its shares are in.
+- A share that decodes short is rejected, never padded.
+
+The source is the untrimmed version-0 archives (`.scratch/v0-dist`, the same
+layout as v1), so no lossy code is stacked on the near-lossless trim. The entry
+checksums in the archive tables are the original ones, which a lossy decode
+cannot match: `ISAAC_ARCHIVE_VERIFY=1` reports these entries now. The mount
+does not check them otherwise (`0x00a17cee`).
+
+**Checked.**
+
+- **Structure, exactly.** `recipe.py vorbis-check` rebuilds every window of
+  sfx.a, afterbirth.a and afterbirthp.a with each share decoded to the very
+  samples it was coded from. All 508 windows come back as the archive's own
+  bytes, and ffmpeg's decode of all 1,922 streams covers its share (0 short).
+- **Quality.** `vorbis_quality.py` codes all 1,724 sounds whole:
+  - the 1/3-octave band envelope (bands within 50 dB of each frame's loudest)
+    differs by a median 0.31-0.33 dB;
+  - loudness moves by at most 1.02 dB;
+  - waveform SNR is 17 dB median, which a perceptual coder is free to be poor
+    at on noise.
+
+  The few sounds whose bands stray by tens of dB do so only in frames about
+  79 dB under their loudest, a fade's noise floor that Vorbis zeroes.
+- **In Chromium.** WebCodecs Vorbis in a Worker aligns at lag 0, and gives at
+  least the coded frame count.
+- **Tests.** `tests/recomp-recipe.test.js` runs `recipe.py vorbis-fixture`:
+  the synthetic archive with its sound as Vorbis, and an oracle decoder in
+  place of the browser's. 47 version-2 pieces come back exactly. The tests
+  also pin:
+  - one frame short is rejected;
+  - other samples give other bytes;
+  - overshoot clamps;
+  - a cut recipe throws.
+
+  8 mutants were killed.
+
+**The decoder's cost, and the reader.** A profile of the reader decoding alone
+(`?decoders=0`) put 2.6 s in the float-to-16-bit loop and 1.3 s in the output
+callback. Copying each output straight into a plane sized to what the share
+needs, and writing through an `Int16Array`, cut both. The reader's cap of 6 now
+counts downloads only (`fetching`). A window waiting for its decode holds no
+slot (`tests/recomp-portable.test.js`: with one slot, the second download
+starts while the first window is with its helper; 2 mutants killed).
+
+**Measured** (the r96 engine, decode helpers, the same pages but stream B):
+
+| | release 9's B | Vorbis B |
+|---|---|---|
+| stream B | 442.3 MB | **367.4 MB** |
+| a cold boot reads of B (trail) | 99.6 MB | **41.8 MB** |
+| with the first run's trail | 118.6 MB | **60.7 MB** |
+| a cold visit to the title, both streams (server stats) | 168.7 MB | **88.6 MB** |
+| preload over (frame 5) at 25 Mbit/s, 40 ms RTT | 51.6 s | **32.1 s** |
+| preload over, local server (no download cost) | 5.02 s | 6.09 s |
+
+The last row is the cost. With the network free, the decode outweighs the
+bytes by ~1 s on this machine. That is what a returning player with stream B
+in the HTTP cache pays. 6 or 8 helpers did not change it; neither did a reused
+decoder (`vorbis-reuse.mjs`: 505 against 480 ms for 100 streams) or a looser
+cap. The helpers' own time around the codec is what grew. A cache of decoded
+windows for returning visits would remove it.
+
+Also passing on the candidate: `sound-check.mjs` (31 sounds played, output
+level 0.145, no complaint in the game's log), live-proof, and `run-start.mjs`
+(the run-start freeze 617 ms). Not deployed: stream B is a new 367 MB upload.

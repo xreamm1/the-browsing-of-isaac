@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const tool = join(root, 'scripts', 'recomp', 'assets', 'recipe.py');
@@ -125,7 +126,7 @@ test('the page and its reader Worker both decode recipe windows (flag 2)', () =>
   assert.ok(portable.includes("if (z === '2') return isaacRecipeDecode(await inflate(stored));"), 'the main-thread window path rebuilds a recipe');
   assert.ok(portable.includes("+ '!' + (+S[p.s].wz.charAt(w.k) || 0) + '*'"), 'the Worker URL carries the flag as 0, 1 or 2');
   const boot = readFileSync(join(root, 'scripts', 'recomp', 'web', 'boot_web.mjs'), 'utf8');
-  assert.ok(boot.includes('if (packed === 2) out = isaacRecipeDecode(out);'), 'the Worker (or its decode helper, round 96) rebuilds a recipe window after inflating it');
+  assert.ok(boot.includes('return Promise.resolve(packed === 2 ? isaacRecipeDecode(out) : out).then('), 'the Worker (or its decode helper, round 96) rebuilds a recipe window after inflating it, synchronous or not (round 96d)');
   assert.ok(boot.includes("String(window.isaacRecipeDecode)") && boot.includes('new Blob([READER_WORKER + recipeSrc]'), 'the decoder source goes to the Worker');
 });
 
@@ -169,4 +170,87 @@ test('lossy.py trims only sound under its own floor and leaves the archive other
   }
   assert.ok(o['sfx/gap.wav'].silenceUntouched, 'digital silence keeps every bit');
   assert.ok(o.stats.bitsPerSample > 0.3 && o.stats.bitsPerSample < 4, JSON.stringify(o.stats));
+});
+
+// Round 96d: sound as Vorbis (recipe version 2, part 3). The browser decodes it
+// (WebCodecs), so a version 2 recipe answers with a Promise; node has no AudioDecoder,
+// so the test decodes each stream into the very samples it was coded from (vorbis.json,
+// by the sha1 of its packets) and the pieces must then come back byte for byte. That
+// pins everything but the codec itself: the head table, the packets' framing, the
+// context dropped before a share and the cut after it, the 16-bit rounding, and the
+// entries' permute and XOR done only once every share has its samples.
+const hasFfmpeg = spawnSync('ffmpeg', ['-version'], { stdio: 'pipe' }).status === 0;
+let vfix = null;
+function getVorbisFixture() {
+  if (vfix) return vfix;
+  const dir = mkdtempSync(join(tmpdir(), 'recipe-vorbis-'));
+  const r = spawnSync(python, [tool, 'vorbis-fixture', dir], { cwd: root, encoding: 'utf8', stdio: 'pipe', timeout: 600000 });
+  assert.equal(r.status, 0, `recipe.py vorbis-fixture failed:\n${r.stdout}\n${r.stderr}`);
+  const meta = JSON.parse(readFileSync(join(dir, 'vorbis.json'), 'utf8'));
+  vfix = { dir, archive: new Uint8Array(readFileSync(join(dir, 'fixture.a'))), pieces: meta.pieces, planes: meta.planes };
+  return vfix;
+}
+process.on('exit', () => { if (vfix) rmSync(vfix.dir, { recursive: true, force: true }); });
+function oracle(planes, calls) {
+  return (head, packets) => {
+    const h = createHash('sha1');
+    for (const p of packets) h.update(p);
+    const got = planes[h.digest('hex')];
+    assert.ok(got, 'a stream the fixture coded');
+    calls.push({ ch: head.ch, rate: head.rate, desc: head.desc.length });
+    return got.map((b) => { const u = Buffer.from(b, 'base64'); return new Float32Array(u.buffer, u.byteOffset, u.length / 4); });
+  };
+}
+const vskip = (!python || !hasFfmpeg) && 'needs python with numpy and ffmpeg';
+
+test('version 2: every piece comes back exactly when each Vorbis stream decodes to its own samples', { skip: vskip }, async () => {
+  const { dir, archive, pieces, planes } = getVorbisFixture();
+  const calls = [];
+  let v2 = 0;
+  for (const pc of pieces) {
+    const r = new Uint8Array(readFileSync(join(dir, pc.file)));
+    let out = decode(r, oracle(planes, calls));
+    if (pc.version === 2) { v2++; assert.ok(out instanceof Promise, `${pc.file}: a version 2 recipe answers with a Promise`); out = await out; }
+    else assert.ok(out instanceof Uint8Array, `${pc.file}: a version 1 recipe still answers at once`);
+    const want = new Uint8Array(pc.hi - pc.lo + pc.tail);
+    want.set(archive.subarray(pc.lo, pc.hi));
+    assert.equal(out.length, want.length, `${pc.file} length`);
+    assert.ok(out.every((v, i) => v === want[i]), `${pc.file} [${pc.lo}, ${pc.hi}) differs`);
+  }
+  assert.ok(v2 >= 40, `${v2} version 2 pieces`);
+  assert.ok(calls.some((c) => c.ch === 1) && calls.some((c) => c.ch === 2), 'mono and stereo Vorbis');
+  assert.ok(new Set(calls.map((c) => c.rate)).size >= 3, 'several rates, each with its head');
+  assert.ok(calls.every((c) => c.desc > 3000), 'the head carries the setup header');
+});
+
+test('version 2: a stream one frame short, other samples, or a cut recipe never rebuilds the archive silently', { skip: vskip }, async () => {
+  const { dir, archive, pieces, planes } = getVorbisFixture();
+  const pc = pieces.find((p) => p.version === 2);
+  const r = new Uint8Array(readFileSync(join(dir, pc.file)));
+  const good = oracle(planes, []);
+  // every share is coded with 2048 frames after it (recipe.py VORBIS_CONTEXT), so 2049
+  // fewer is one frame short of the share: rejected with the count, never padded
+  const short = (head, packets) => good(head, packets).map((x) => x.subarray(0, x.length - 2049));
+  await assert.rejects(Promise.resolve(decode(r, short)), (e) => {
+    const m = /Vorbis gave (\d+) frames, the share needs (\d+)/.exec(e.message);
+    return m && Number(m[2]) - Number(m[1]) === 1;
+  });
+  // the samples a little off: the bytes are not the archive's (the decode is used, not skipped)
+  const off = (head, packets) => good(head, packets).map((x) => x.map((v) => v + 0.001));
+  const out = await decode(r, off);
+  const want = archive.subarray(pc.lo, pc.hi);
+  assert.ok(!want.every((v, i) => v === out[i]), 'other samples, other bytes');
+  // a decoder's overshoot saturates: 2.0 and 0.99999 both make 32767, so the same bytes
+  const level = (v) => (head, packets) => good(head, packets).map((x) => new Float32Array(x.length).fill(v));
+  const loud = await decode(r, level(2)), full = await decode(r, level(0.99999));
+  assert.ok(loud.every((v, i) => v === full[i]), 'an overshooting sample is clamped to 16 bits');
+  const quiet = await decode(r, level(-2)), floor = await decode(r, level(-1));
+  assert.ok(quiet.every((v, i) => v === floor[i]), 'and so is an undershooting one');
+  // a packet length that runs past its part
+  const bad = r.slice();
+  const at = bad.indexOf(3, 12);
+  assert.ok(at > 0);
+  let threw = false;
+  try { const x = decode(bad.subarray(0, bad.length - 1), good); if (x instanceof Promise) await x; } catch { threw = true; }
+  assert.ok(threw, 'a truncated version 2 recipe throws or rejects');
 });

@@ -97,7 +97,11 @@ function helperWorkers(source, log, options = {}) {
       };
       if (options.breakDecode) context.DecompressionStream = class { constructor() { throw new Error('broken'); } };
       new Script(source).runInNewContext(context);
-      this.post = (message) => { log.sent.push({ helper: index, ...message }); setTimeout(() => context.onmessage({ data: message }), 0); };
+      this.post = (message) => {
+        log.sent.push({ helper: index, ...message });
+        const go = () => setTimeout(() => context.onmessage({ data: message }), 0);
+        if (options.holdDecode && message.decode) (log.held ||= []).push(go); else go();
+      };
     }
     postMessage(message) { this.post(message); }
     terminate() { log.terminated = (log.terminated || 0) + 1; }
@@ -973,6 +977,29 @@ test('portable reader keeps a busy helper until its decode answers, and sends it
   assert.deepEqual(Buffer.from((await first).buf), a.subarray(400, 1424), 'the busy helper still answered');
   assert.equal(decodes(), before + 1, 'nothing more was sent to a retiring helper');
   assert.equal(network.helperLog.terminated, 2, 'and it went once it had answered');
+});
+
+// Round 96d: the reader's cap is on downloads. A window whose decode is still out (a
+// Vorbis one answers slowly) holds no download slot, so with one slot the next trail
+// window is already being fetched while the first is decoding.
+test('portable reader starts the next download while a window is still decoding', { timeout: 5000 }, async () => {
+  const data = chunkData(0, 1);
+  const a = Buffer.alloc(WIN, 61), b = Buffer.alloc(WIN, 7), za = gzipSync(a), zb = gzipSync(b), chunk = Buffer.concat([za, zb]);
+  Object.assign(data.streams[1], { base: 'https://archives.test/slots/c', win: WIN, wl: [za.length, zb.length], wz: '11', stored: [chunk.length] });
+  const h = deferredPortable(data);
+  await answerProbes(h, [chunk]);
+  assert.equal(await h.provider.ready, true);
+  const rel = 'resources/packed/archive.a';
+  const network = deferredReaderWorker(h.provider, { helpers: 1, holdDecode: true });
+  const job = (off) => ['k' + off, h.provider.urlFor(rel, off, 1024), 1024];
+  network.post({ jobs: [job(0), job(WIN)], budget: 64 << 20, parallel: 1 });
+  assert.equal(network.requests.length, 1, 'one slot: one download');
+  answerRange(network.requests[0], chunk);
+  for (let i = 0; i < 50 && !(network.helperLog.held || []).length; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.equal(network.helperLog.held.length, 1, 'the first window is with its decode helper, unanswered');
+  for (let i = 0; i < 50 && network.requests.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.equal(network.requests.length, 2, 'and the second download started meanwhile');
+  for (const go of network.helperLog.held.splice(0)) go();
 });
 
 test('portable reader with no helpers decodes as before, and a failing helper fails its read', { timeout: 5000 }, async () => {

@@ -278,6 +278,9 @@ let trailShipped = false;                                 // the trail came with
 const READER_WORKER = `
 const cache = new Map(), inflight = new Map(), done = new Set();
 let jobs = [], ji = 0, budget = 0, held = 0, inflightBytes = 0, parallel = 4, prefetched = 0, ahead = 0;
+// round 96d: the cap is on downloads; a window waiting only for its decode (a
+// Vorbis window's is asynchronous and slow to answer) holds no slot
+let fetching = 0;
 // Round 77: the chunked build's keystream. Named xorKey rather than key, because
 // a job message already carries a field of that name -- the cache key of the
 // window it wants -- and a handler that greeted every one of those as a new
@@ -327,9 +330,9 @@ function decodeHere(buf, at, packed, from, take) {
   return drain(ds.readable).then((out) => {
     // 2: a window recipe -- plain entry bytes and coded PCM, rebuilt into the
     // version-0 archive's own bytes by isaacRecipeDecode (recipe.js, appended
-    // to this Worker's source by the page)
-    if (packed === 2) out = isaacRecipeDecode(out);
-    return out.slice(from, from + take).buffer;
+    // to this Worker's source by the page). Round 96d: a recipe with Vorbis in it
+    // answers with a Promise (the browser's decoder is asynchronous).
+    return Promise.resolve(packed === 2 ? isaacRecipeDecode(out) : out).then((w) => w.slice(from, from + take).buffer);
   });
 }
 // Round 96: the boot's sound preload waited on this Worker decoding recipes --
@@ -382,6 +385,9 @@ function addHelpers(n) {
 }
 function start(key, url, len, why, want) {
   inflight.set(key, want | 0); held += len; inflightBytes += len;
+  fetching += 1;
+  let fetched = false;
+  const landed = () => { if (!fetched) { fetched = true; fetching -= 1; pump(); } };
   // round 70: a portable build points several windows at one large chunk and puts
   // the byte range in the fragment, which no server ever sees. A host that ignores
   // Range sends the whole chunk, so the body is cut to size here.
@@ -475,6 +481,7 @@ function start(key, url, len, why, want) {
     return buf;
   };
   tries().then(async (buf) => {
+    landed();
     if (buf && winAt >= 0) {
       // a host that ignored the Range sent the whole chunk: the window's own
       // bytes still start where the fragment said
@@ -489,12 +496,13 @@ function start(key, url, len, why, want) {
     if (w) { done.add(key); postMessage({ want: w, buf, hit: why !== 'want', pf: prefetched, ah: ahead }, buf ? [buf] : []); }
     else if (buf && !done.has(key)) { cache.set(key, buf); held += buf.byteLength; if (why === 'trail') prefetched += 1; else ahead += 1; }
   }).catch(() => {
+    landed();
     const w = inflight.get(key); inflight.delete(key); held -= len; inflightBytes -= len;
     if (w) postMessage({ want: w, buf: null, hit: false, pf: prefetched, ah: ahead });
   }).finally(pump);
 }
 function pump() {
-  while (inflight.size < parallel && ji < jobs.length && held < budget) {
+  while (fetching < parallel && ji < jobs.length && held < budget) {
     const [key, url, len] = jobs[ji++];
     if (!cache.has(key) && !inflight.has(key) && !done.has(key)) start(key, url, len, 'trail', 0);
   }
@@ -516,7 +524,7 @@ onmessage = (e) => {
   if (buf) { cache.delete(d.key); held -= buf.byteLength; done.add(d.key); postMessage({ want: d.want, buf, hit: true, pf: prefetched, ah: ahead }, [buf]); }
   else if (inflight.has(d.key)) inflight.set(d.key, d.want);
   else start(d.key, d.url, d.len, 'want', d.want);
-  for (const [k, u, l] of d.ahead || []) if (inflight.size < parallel && held < budget && !cache.has(k) && !inflight.has(k) && !done.has(k)) start(k, u, l, 'ahead', 0);
+  for (const [k, u, l] of d.ahead || []) if (fetching < parallel && held < budget && !cache.has(k) && !inflight.has(k) && !done.has(k)) start(k, u, l, 'ahead', 0);
   pump();
 };
 `;
