@@ -9072,3 +9072,25 @@ helpers included, and pins:
 
 11 mutants were killed. The page reached the title in 9.4 s, and the main
 thread is now the boot's limit (5.1 s busy).
+
+### 21.124 Round 96c: the wasm code cache, tested in a real profile -- not reachable
+
+The portable page compiles the engine with `WebAssembly.instantiate(bytes)`,
+which round 40's code cache never covers, so every visit compiles 54 MB again.
+`heavy-bench.mjs --userdir=<dir> --wasmtrace` runs the full Chromium binary
+(new headless, `channel: 'chromium'`) in a persistent profile and counts V8's
+wasm trace events from navigation on. Two visits each, a minute of the stage-8
+scene in each:
+
+| how the module was compiled | visit 1 | visit 2 |
+|---|---|---|
+| `instantiateStreaming` of a Cache Storage response (keyed by the engine) | TopTier 838, no SerializeModule | entry hit; TopTier 810, no Deserialize |
+| `instantiateStreaming(fetch)` of an immutable HTTP response (control) | TopTier 813, **SerializeModule x13** | TopTier 805, no Deserialize |
+
+V8 serialises only for an HTTP response, and even then the next visit
+recompiles the same ~805 functions. That is what round 40 saw: 155-214 MB of
+code-cache entries written and never read, most likely too large an entry
+for the cache. The second visit's frame 60 came ~1.1 s earlier in both setups
+alike, which is the warm machine, not the cache. Not shipped, and nothing changes
+in the page. A module split into separately cached parts is the only way left,
+and that is a different project.
