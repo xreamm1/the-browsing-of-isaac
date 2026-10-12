@@ -313,6 +313,73 @@ function unscramble(buf, pos) {
   for (let i = 0; i < b.length; i++) { const at = pos + i; b[i] ^= xorKey[at & 255] ^ ((at >> 8) & 255); }
   return b.buffer;
 }
+// A fetched window, unscrambled, inflated, rebuilt from its recipe and cut.
+function decodeHere(buf, at, packed, from, take) {
+  // unscramble hands back an ArrayBuffer, and ArrayBuffer.slice returns
+  // another ArrayBuffer -- which has no .buffer. An uncompressed window
+  // (Vorbis, Theora) skips the inflate below, so it reached the cut still
+  // an ArrayBuffer and every such read came back undefined. Take a view.
+  let win = new Uint8Array(unscramble(buf, at));
+  if (!packed) return Promise.resolve(win.slice(from, from + take).buffer);
+  // into the stream's writer and drained: neither a Blob nor a Response keeps a copy
+  const ds = new DecompressionStream('gzip'), dw = ds.writable.getWriter();
+  dw.write(win).catch(() => {}); dw.close().catch(() => {});
+  return drain(ds.readable).then((out) => {
+    // 2: a window recipe -- plain entry bytes and coded PCM, rebuilt into the
+    // version-0 archive's own bytes by isaacRecipeDecode (recipe.js, appended
+    // to this Worker's source by the page)
+    if (packed === 2) out = isaacRecipeDecode(out);
+    return out.slice(from, from + take).buffer;
+  });
+}
+// Round 96: the boot's sound preload waited on this Worker decoding recipes --
+// 92-96% busy for that whole stretch while the page's thread sat idle. The
+// fetching stays here, in the trail's order, and the packed windows are decoded
+// by helpers: copies of this script the page asks for ({ helpers: n }), each
+// answering { decode } messages. With none (or none that started) they are
+// decoded here, as before.
+// They are for the boot: the first clear (the boot is over) retires them, each
+// once the decodes it holds have answered (their isolates cost ~32 MB).
+const helpers = [], hwait = new Map();
+let hnext = 0, hseq = 0, retiring = false;
+function retireIdle() {
+  for (let i = helpers.length - 1; i >= 0; i--) {
+    const h = helpers[i];
+    let busy = false;
+    for (const r of hwait.values()) if (r.h === h) { busy = true; break; }
+    if (!busy) { helpers.splice(i, 1); try { h.terminate(); } catch (e) { /* gone */ } }
+  }
+}
+function decodeWin(buf, at, packed, from, take) {
+  if (!packed || !helpers.length || retiring) return decodeHere(buf, at, packed, from, take);
+  const h = helpers[hnext++ % helpers.length], id = ++hseq;
+  return new Promise((resolve, reject) => {
+    hwait.set(id, { h, resolve, reject });
+    h.postMessage({ decode: id, buf, at, packed, from, take }, [buf]);
+  });
+}
+function addHelpers(n) {
+  for (let i = 0; i < n; i++) {
+    let h;
+    try { h = new Worker(self.location.href); } catch (e) { return; }
+    if (xorKey) h.postMessage({ xorKey });
+    h.onmessage = (e) => {
+      const r = hwait.get(e.data.decoded);
+      if (!r) return;
+      hwait.delete(e.data.decoded);
+      if (e.data.buf) r.resolve(e.data.buf); else r.reject(new Error(e.data.err || 'decode failed'));
+      if (retiring) retireIdle();
+    };
+    h.onerror = () => {
+      // a helper that died: its windows fail like a failed fetch, the rest go elsewhere
+      const k = helpers.indexOf(h);
+      if (k >= 0) helpers.splice(k, 1);
+      for (const [id, r] of hwait) if (r.h === h) { hwait.delete(id); r.reject(new Error('decode helper failed')); }
+      try { h.terminate(); } catch (e2) { /* gone */ }
+    };
+    helpers.push(h);
+  }
+}
 function start(key, url, len, why, want) {
   inflight.set(key, want | 0); held += len; inflightBytes += len;
   // round 70: a portable build points several windows at one large chunk and puts
@@ -412,22 +479,7 @@ function start(key, url, len, why, want) {
       // a host that ignored the Range sent the whole chunk: the window's own
       // bytes still start where the fragment said
       if (buf.byteLength > want1 - want0 + 1) buf = buf.slice(want0, want1 + 1);
-      // unscramble hands back an ArrayBuffer, and ArrayBuffer.slice returns
-      // another ArrayBuffer -- which has no .buffer. An uncompressed window
-      // (Vorbis, Theora) skips the inflate below, so it reached the cut still
-      // an ArrayBuffer and every such read came back undefined. Take a view.
-      let win = new Uint8Array(unscramble(buf, winAt));
-      if (winPacked) {
-        // into the stream's writer and drained: neither a Blob nor a Response keeps a copy
-        const ds = new DecompressionStream('gzip'), dw = ds.writable.getWriter();
-        dw.write(win).catch(() => {}); dw.close().catch(() => {});
-        win = await drain(ds.readable);
-      }
-      // 2: a window recipe -- plain entry bytes and coded PCM, rebuilt into the
-      // version-0 archive's own bytes by isaacRecipeDecode (recipe.js, appended
-      // to this Worker's source by the page)
-      if (winPacked === 2) win = isaacRecipeDecode(win);
-      buf = win.slice(winFrom, winFrom + winTake).buffer;
+      buf = await decodeWin(buf, winAt, winPacked, winFrom, winTake);
     }
     // a host that ignored the Range sent the whole chunk: put it back from the
     // chunk's own start, then cut out the window
@@ -449,9 +501,16 @@ function pump() {
 }
 onmessage = (e) => {
   const d = e.data;
-  if (d.xorKey) { xorKey = new Uint8Array(d.xorKey); return; }
+  if (d.xorKey) { xorKey = new Uint8Array(d.xorKey); for (const h of helpers) h.postMessage({ xorKey }); return; }
+  if (d.decode) {
+    Promise.resolve().then(() => decodeHere(d.buf, d.at, d.packed, d.from, d.take)).then(
+      (buf) => postMessage({ decoded: d.decode, buf }, [buf]),
+      (e) => postMessage({ decoded: d.decode, err: String((e && e.message) || e) }));
+    return;
+  }
+  if (d.helpers) { addHelpers(d.helpers); return; }
   if (d.jobs) { jobs = d.jobs; budget = d.budget; parallel = d.parallel; pump(); return; }
-  if (d.clear) { cache.clear(); held = inflightBytes; budget = d.budget; jobs = []; ji = 0; return; }
+  if (d.clear) { cache.clear(); held = inflightBytes; budget = d.budget; jobs = []; ji = 0; retiring = true; retireIdle(); return; }
   if (!d.want) return;
   const buf = cache.get(d.key);
   if (buf) { cache.delete(d.key); held -= buf.byteLength; done.add(d.key); postMessage({ want: d.want, buf, hit: true, pf: prefetched, ah: ahead }, [buf]); }
@@ -506,6 +565,11 @@ function startReader() {
   // round 77: a chunked build's payload is scrambled, and a window is a range the
   // Worker fetches, so the Worker is where it has to be put back
   if (hooks.chunkKey) w.postMessage({ xorKey: hooks.chunkKey });
+  // round 96: helpers decode the packed windows beside the reader (its source
+  // above); ?decoders=0 keeps every decode on the reader, as rounds 56-95 did
+  const asked = params.get('decoders'), cores = Number(navigator.hardwareConcurrency) || 2;
+  const decoders = asked !== null && asked !== '' ? Math.max(0, Math.min(8, Math.floor(Number(asked)) || 0)) : Math.max(0, Math.min(4, cores - 2));
+  if (decoders) w.postMessage({ helpers: decoders });
   trailKept = list.length;
   reader = w;
   w.onmessage = (e) => {

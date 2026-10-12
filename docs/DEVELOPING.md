@@ -29,6 +29,7 @@ a room is ready to show. URL options:
 | `?stats=1` | Loading and runtime diagnostics |
 | `?saves=1` | A dialog for the whole save store |
 | `?persist=0` | Don't keep saves (for testing) |
+| `?decoders=<n>` | Decode helpers for the archive reader during the boot (default: cores − 2, at most 4; `0` decodes on the reader alone) |
 
 A build that ships its boot trail (the archive windows a boot reads) shows the
 loading bar in bytes: the startup download, then the boot's own reads, which are

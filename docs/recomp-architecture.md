@@ -9015,3 +9015,60 @@ recomp suites touched by the change pass 67/67.
   callees proven to restore them on every path, and MSVC's /LTCG can give a
   static function a custom convention. That needs a per-callee proof from the
   p-code, not a text pass.
+
+### 21.123 Round 96b: the boot's sound preload, decoded by more than one thread
+
+**Where a cold boot waits.** With the network free (a local server), the page
+reaches frame 300 in 12.6 s, and its main thread is idle for 67% of that. Frames
+2 to 5 take 5.7 s: that is the engine preloading its sound catalogue, inside one
+frame, one archive window at a time. Each read suspends the wasm stack until the
+reader Worker answers. A profile of that Worker (`worker-prof.mjs`: raw CDP,
+auto-attached and paused on start) shows it 92-96% busy for the whole stretch,
+decoding recipe windows (`channel`, `word`, `unary`, `pcmDecode`: 3.3 s of its
+4.1 s). The machine has 16 cores, and a phone has 4 to 8.
+
+**The first shape lost on a slow link.** Several reader Workers, each owning
+the windows whose key hashes to it, cut the preload by 2.0 s on localhost.
+At 50 Mbit/s with a 30 ms RTT, though, they lost 0.5 s, and 1.2 s once the
+fetches in flight were held to the old 6. Splitting the queue by hash breaks
+the trail's download order, and order is what counts when bandwidth is the limit.
+
+**What shipped.** One reader still does every fetch, in the trail's order,
+with 6 in flight, so the network sees exactly what it saw before. Only the decode
+moves. The page sends `{ helpers: n }`, and the reader starts n copies of its own
+script (`new Worker(self.location.href)`). Each packed window (flags 1 and 2) goes
+to the next helper as a transferred buffer, and comes back unscrambled,
+inflated, rebuilt and cut (`decodeHere`, the old inline code). A raw window
+never leaves the reader. A helper that throws answers with an error, and its
+read fails as a failed fetch does. A helper that dies fails only its own
+decodes. The first `clear` (the run trail's, or frame 600's) retires the
+helpers, each once the decodes it holds have answered. Before that, they cost
+~32 MB of renderer memory at frame 700.
+
+n is `hardwareConcurrency - 2`, at most 4. `?decoders=0` decodes on the reader
+alone, as rounds 56-95 did.
+
+| cold boot, local server, 2 interleaved pairs | decoders=0 | helpers (4) |
+|---|---|---|
+| preload over (frame 5) | 7.23 s | **4.53 s** |
+| frame 300 | 12.13 s | **9.42 s** |
+| frame 5 at 50 Mbit/s, 30 ms RTT | 28.19 s | **27.42 s** |
+| renderer footprint at frame 700 (`raw-mem.mjs`) | 911 MB | 904 MB |
+
+With 2 and 3 helpers (the first shape's counts) the preload took 6.77 and 6.29 s.
+
+**Checked.** `?ISAAC_ARCHIVE_VERIFY=1` with the helpers on: the mount read and
+checksummed every archive entry through the engine's own decoder, with no
+mismatch and no error. live-proof, `sound-check.mjs`, `lua-check.mjs`,
+`run-start.mjs` (the run-start freeze measured 533-933 ms against 883-950
+without helpers) and `pad-check.mjs` 8/8 also pass.
+`tests/recomp-portable.test.js` runs the real Worker source in vm contexts,
+helpers included, and pins:
+
+- the bytes of packed and raw windows;
+- that only the packed ones go to a helper, and both helpers are used;
+- that a failing helper fails its read rather than hanging it;
+- the retirement, idle and busy.
+
+11 mutants were killed. The page reached the title in 9.4 s, and the main
+thread is now the boot's limit (5.1 s busy).

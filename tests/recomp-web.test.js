@@ -460,7 +460,7 @@ test('round 60: after the boot the reader Worker drops what it fetched ahead and
   assert.ok(b.includes('const READER_PLAY_BUDGET = 8 << 20, READER_CLEAR_FRAME = 600;'), 'the play budget and the frame');
   assert.ok(b.includes("if (n === READER_CLEAR_FRAME && reader && !runArmed) { reader.postMessage({ clear: true, budget: READER_PLAY_BUDGET }); trailJobs = null; }"), 'the page tells the Worker at frame 600, unless the run\'s trail already cleared it');
   assert.ok(b.includes("reader.postMessage({ clear: true, budget: READER_PLAY_BUDGET + bytes });"), 'the run\'s trail clears the boot\'s leftovers and keeps room for its own windows');
-  assert.ok(b.includes("if (d.clear) { cache.clear(); held = inflightBytes; budget = d.budget; jobs = []; ji = 0; return; }"), 'the Worker drops its cache and the trail, keeps what is in flight, takes the new budget');
+  assert.ok(b.includes("if (d.clear) { cache.clear(); held = inflightBytes; budget = d.budget; jobs = []; ji = 0; retiring = true; retireIdle(); return; }"), 'the Worker drops its cache and the trail, keeps what is in flight, takes the new budget, and retires its decode helpers (round 96)');
 });
 
 test('round 60: a large texture upload goes in bands, so the GL transfer chunk never grows past 4 MB', () => {

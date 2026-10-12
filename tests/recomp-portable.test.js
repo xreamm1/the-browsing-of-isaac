@@ -80,13 +80,39 @@ function deferredPortable(data, search = '', options = {}) {
   return { ...network, provider: window.isaacPortable };
 }
 
-function deferredReaderWorker(provider) {
+// Round 96's decode helpers: copies of the reader's source the reader starts with
+// `new Worker(self.location.href)`. Each runs in a context of its own; messages
+// cross asynchronously, as structured clones do. `log` records what each helper
+// was sent; `breakDecode` makes every helper's decode throw.
+function helperWorkers(source, log, options = {}) {
+  return class FakeWorker {
+    constructor(url) {
+      assert.equal(url, 'blob:reader', 'a helper is the reader script itself');
+      const self = this, index = log.started++;
+      const context = {
+        Blob, Response, DecompressionStream, Uint8Array, ArrayBuffer, setTimeout, Promise, Error, String,
+        fetch: () => { throw new Error('a helper never fetches'); },
+        self: { location: { href: 'blob:reader' } },
+        postMessage(message) { setTimeout(() => self.onmessage && self.onmessage({ data: message }), 0); },
+      };
+      if (options.breakDecode) context.DecompressionStream = class { constructor() { throw new Error('broken'); } };
+      new Script(source).runInNewContext(context);
+      this.post = (message) => { log.sent.push({ helper: index, ...message }); setTimeout(() => context.onmessage({ data: message }), 0); };
+    }
+    postMessage(message) { this.post(message); }
+    terminate() { log.terminated = (log.terminated || 0) + 1; }
+  };
+}
+
+function deferredReaderWorker(provider, options = {}) {
   // Cook the actual template, as the page and recomp-web.test.js do.
   const source = new Function('return `' + /const READER_WORKER = `([\s\S]*?)\r?\n`;/.exec(bootWeb)[1] + '`')();
-  const network = deferredFetch(), replies = new Map();
+  const network = deferredFetch(), replies = new Map(), helperLog = { started: 0, sent: [] };
   let nextWant = 1;
   const worker = {
     fetch: network.fetch, Blob, Response, DecompressionStream, Uint8Array, ArrayBuffer, setTimeout,
+    self: { location: { href: 'blob:reader' } },
+    Worker: helperWorkers(source, helperLog, options),
     postMessage(message) {
       if (message.download) {
         const { url, from, to } = message.download;
@@ -99,8 +125,11 @@ function deferredReaderWorker(provider) {
     },
   };
   new Script(source).runInNewContext(worker);
+  if (options.helpers) worker.onmessage({ data: { helpers: options.helpers } });
   return {
     ...network,
+    helperLog,
+    post(data) { worker.onmessage({ data }); },
     read(url, len) {
       const want = nextWant++;
       return new Promise((resolve) => {
@@ -872,6 +901,88 @@ test('portable compressed windows share stable direct and worker cache identitie
     assert.deepEqual(Buffer.from(message.buf), expected[i]);
   }
   assert.equal(h.requests.filter((r) => !r.range).length, 0, 'window reads never preload whole archives');
+});
+
+// Round 96: two packed windows and a raw one through a reader with two decode
+// helpers. The helpers decode the packed ones (and only those), the reader
+// still does every fetch, and the bytes are exact whichever answer comes first.
+async function helperWindows(options) {
+  const data = chunkData(0, 2);
+  const raw = Buffer.allocUnsafe(WIN);
+  for (let i = 0; i < raw.length; i++) raw[i] = (i * 37 + (i >>> 8)) & 255;
+  const a = Buffer.alloc(WIN, 61), b = Buffer.allocUnsafe(WIN);
+  for (let i = 0; i < b.length; i++) b[i] = (i * 13) & 255;
+  // two windows a chunk: [a, raw] and [b]
+  const za = gzipSync(a), zb = gzipSync(b), chunks = [Buffer.concat([za, raw]), zb];
+  Object.assign(data.streams[1], {
+    base: 'https://archives.test/helpers/c', win: WIN, wl: [za.length, raw.length, zb.length], wz: '101',
+    stored: chunks.map((c) => c.length), bytes: 3 * WIN,
+  });
+  data.files['resources/packed/archive.a'].size = 3 * WIN;
+  const h = deferredPortable(data);
+  await answerProbes(h, chunks);
+  assert.equal(await h.provider.ready, true);
+  const rel = 'resources/packed/archive.a';
+  const cuts = [{ off: 97, len: 2048 }, { off: WIN + 173, len: 3072 }, { off: 2 * WIN + 5, len: 4096 }];
+  const expected = [a.subarray(97, 97 + 2048), raw.subarray(173, 173 + 3072), b.subarray(5, 5 + 4096)];
+  const network = deferredReaderWorker(h.provider, options);
+  const messages = cuts.map(({ off, len }) => network.read(h.provider.urlFor(rel, off, len), len));
+  for (const request of [...network.requests].reverse()) answerRange(request, chunks[Number(fileName(request).slice(1, -4))]);
+  return { network, expected, results: await Promise.all(messages), h, rel, chunks, a };
+}
+
+test('portable reader decode helpers return exact bytes and decode only packed windows', { timeout: 5000 }, async () => {
+  const { network, expected, results } = await helperWindows({ helpers: 2 });
+  for (const [i, message] of results.entries()) {
+    assert.ok(message.buf instanceof ArrayBuffer, `window ${i} is a transferable buffer`);
+    assert.deepEqual(Buffer.from(message.buf), expected[i], `window ${i} bytes`);
+  }
+  assert.equal(network.helperLog.started, 2);
+  const decodes = network.helperLog.sent.filter((m) => m.decode);
+  assert.equal(decodes.length, 2, 'the two packed windows, not the raw one');
+  assert.deepEqual(decodes.map((m) => m.helper).sort(), [0, 1], 'shared between the helpers');
+  assert.equal(network.requests.length, 3, 'the reader fetches each window once');
+});
+
+test('portable reader retires its decode helpers at the first clear and decodes alone after it', { timeout: 5000 }, async () => {
+  const { network, h, rel, chunks, a } = await helperWindows({ helpers: 2 });
+  assert.equal(network.helperLog.terminated || 0, 0, 'the helpers live through the boot');
+  network.post({ clear: true, budget: 8 << 20 });
+  assert.equal(network.helperLog.terminated, 2, 'idle helpers go at the clear');
+  const before = network.helperLog.sent.filter((m) => m.decode).length;
+  const read = network.read(h.provider.urlFor(rel, 300, 1024) + '', 1024);
+  for (const request of network.requests.filter((r) => !r.settled)) answerRange(request, chunks[Number(fileName(request).slice(1, -4))]);
+  assert.deepEqual(Buffer.from((await read).buf), a.subarray(300, 1324));
+  assert.equal(network.helperLog.sent.filter((m) => m.decode).length, before, 'the reader decoded it itself');
+});
+
+test('portable reader keeps a busy helper until its decode answers, and sends it no more', { timeout: 5000 }, async () => {
+  const { network, h, rel, chunks, a } = await helperWindows({ helpers: 2 });
+  const answer = () => { for (const request of network.requests.filter((r) => !r.settled)) answerRange(request, chunks[Number(fileName(request).slice(1, -4))]); };
+  const decodes = () => network.helperLog.sent.filter((m) => m.decode).length;
+  const before = decodes();
+  const first = network.read(h.provider.urlFor(rel, 400, 1024), 1024);
+  answer();
+  for (let i = 0; i < 50 && decodes() === before; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.equal(decodes(), before + 1, 'the first read went to a helper');
+  network.post({ clear: true, budget: 8 << 20 });
+  assert.equal(network.helperLog.terminated, 1, 'only the idle helper goes at once');
+  const second = network.read(h.provider.urlFor(rel, 500, 1024), 1024);
+  answer();
+  assert.deepEqual(Buffer.from((await second).buf), a.subarray(500, 1524));
+  assert.deepEqual(Buffer.from((await first).buf), a.subarray(400, 1424), 'the busy helper still answered');
+  assert.equal(decodes(), before + 1, 'nothing more was sent to a retiring helper');
+  assert.equal(network.helperLog.terminated, 2, 'and it went once it had answered');
+});
+
+test('portable reader with no helpers decodes as before, and a failing helper fails its read', { timeout: 5000 }, async () => {
+  const plain = await helperWindows({});
+  for (const [i, message] of plain.results.entries()) assert.deepEqual(Buffer.from(message.buf), plain.expected[i]);
+  assert.equal(plain.network.helperLog.started, 0);
+  const broken = await helperWindows({ helpers: 1, breakDecode: true });
+  assert.equal(broken.results[0].buf, null, 'a decode that failed answers the read with no bytes');
+  assert.deepEqual(Buffer.from(broken.results[1].buf), broken.expected[1], 'a raw window needs no helper');
+  assert.equal(broken.results[2].buf, null);
 });
 
 test('portable offline reads span inline chunks without network activity', async () => {

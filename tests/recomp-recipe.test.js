@@ -125,7 +125,7 @@ test('the page and its reader Worker both decode recipe windows (flag 2)', () =>
   assert.ok(portable.includes("if (z === '2') return isaacRecipeDecode(await inflate(stored));"), 'the main-thread window path rebuilds a recipe');
   assert.ok(portable.includes("+ '!' + (+S[p.s].wz.charAt(w.k) || 0) + '*'"), 'the Worker URL carries the flag as 0, 1 or 2');
   const boot = readFileSync(join(root, 'scripts', 'recomp', 'web', 'boot_web.mjs'), 'utf8');
-  assert.ok(boot.includes('if (winPacked === 2) win = isaacRecipeDecode(win);'), 'the Worker rebuilds a recipe window after inflating it');
+  assert.ok(boot.includes('if (packed === 2) out = isaacRecipeDecode(out);'), 'the Worker (or its decode helper, round 96) rebuilds a recipe window after inflating it');
   assert.ok(boot.includes("String(window.isaacRecipeDecode)") && boot.includes('new Blob([READER_WORKER + recipeSrc]'), 'the decoder source goes to the Worker');
 });
 
