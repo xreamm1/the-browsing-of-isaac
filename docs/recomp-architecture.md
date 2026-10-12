@@ -9251,7 +9251,40 @@ again; at 640 the host had 192.
 - **In the browser.** live-proof, `sound-check.mjs` (31 sounds), `run-start.mjs`
   and `pad-check.mjs` 8/8 pass. Screenshots of the title (menu text drawn from a
   kept glyph page) and of the stage-8 room look right.
-- **Still to do before it ships:** a real-WebGL test of the draw-time path.
+- **The draw-time path in real WebGL (round 97c, before it shipped).**
+  - *Every way to see a kept texture.* The game imports 86 GL entry points.
+    For textures that is bind, upload, sub-upload, parameter, delete,
+    framebuffer attachment, `glReadPixels` and two draws (`glDrawElements`,
+    `glDrawArraysInstancedEXT`; `glMultiDrawArraysIndirectEXT` is a no-op on
+    the web). There is no copy into a texture, no mipmap generation and no
+    compressed upload, so every path that samples or writes a kept texture is
+    hooked.
+  - *Six floors of play.* `lazy-check.mjs` runs a seeded run through the debug
+    console's `stage 2, 4, 6, 8, 10, 11`, with enemies spawned, walking and
+    firing on each, and the pause menu opened. It counts, from the page's own
+    WebGL calls, every draw made while a 2D texture bound on any unit has never
+    had a level-0 image. Result: **0 of 237,306 draws**. The same count without
+    lazy textures is also 0. A positive control, an imageless texture drawn on
+    a scratch canvas, is caught. Chrome itself logs nothing for such a draw in
+    WebGL 2, so its console cannot be the test.
+
+| six floors, CPU x1 | lazy | without |
+|---|---|---|
+| uploads during the tour | 192, 133.7 MB | 252, 121.3 MB |
+| slowest upload call | 3.3 ms | 0.6 ms |
+| most upload time in one frame | 9.5 ms | 6.0 ms |
+| frame p50 / p99 | 16.7 / 16.8 ms | 16.7 / 16.8 ms |
+| frames over 50 ms (the floor loads) | 14 | 14 |
+
+  - *Pictures.* Screenshots of every floor, the pause menu, and the intro
+    frame by frame match the build without lazy textures.
+  - *Memory.* Measured over raw CDP, with no DevTools domain enabled, at the
+    title: the renderer went from 978 to 1,080 MB (the 704 MiB memory) and the
+    GPU process from 460 to 180 MB. Together, **1,438 to 1,260 MB**. After play
+    it was 1,422 to 1,232 MB.
+  - *Speed.* No change: 59.1 fps presented on a 164 Hz screen; 60 Hz
+    (three pairs) and CPU x4 (two pairs) within noise of release 15.
+- **Shipped** as release 16, on top of release 15's frame-limiter fix (21.127).
 
 ### 21.127 Round 97b: a display faster than 66 Hz played at 30 fps
 
