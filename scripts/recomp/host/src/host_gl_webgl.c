@@ -105,6 +105,7 @@ void isaac_glc_report(void);
 
 static uint32_t g_gl_calls, g_gl_errors;
 static uint32_t g_present_count;
+static uint32_t g_lazy_at_draw, g_lazy_at_write, g_lazy_at_attach;   /* round 97: where kept textures got their pixels */
 
 /* Round 44: redundant state calls are not forwarded. The engine re-issues
  * the same glUseProgram (73 a frame), glActiveTexture(GL_TEXTURE0) (30),
@@ -248,6 +249,68 @@ void isaac_web_gl_report(void) {
     isaac_log("[isaac][gl] redundant state calls skipped: useProgram %u, activeTexture %u, bindTexture %u, blend %u, viewport %u, "
               "attrib enables %u, uniforms %u",
               gls_skip_prog, gls_skip_unit, gls_skip_tex, gls_skip_blend, gls_skip_vp, gls_skip_attrib, gls_skip_uniform);
+    isaac_lazy_tex_report();
+    if (g_lazy_at_draw + g_lazy_at_write + g_lazy_at_attach)
+        isaac_log("[isaac][gl] kept textures given their pixels at a draw %u, at a write %u, at an attachment %u",
+                  g_lazy_at_draw, g_lazy_at_write, g_lazy_at_attach);
+}
+
+/* ---- textures that reach the GPU when first used (round 97) -------------------
+ * host_gl_lazy.c keeps a large RGBA upload's pixels instead of forwarding it.
+ * The texture is given them the first time it can be seen: a draw while it is
+ * bound on any unit, a glTexSubImage2D into it, a framebuffer attachment, or a
+ * new upload of another level. A bind alone does not: the engine's loader
+ * binds, uploads and may bind again, and only a draw samples. */
+
+/* The upload itself: whole, or banded (round 60). Also the callback through
+ * which a kept texture gets its pixels, into whatever is bound on the active unit. */
+static void tex_upload(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h,
+                       uint32_t border, uint32_t format, uint32_t type, const uint8_t *px) {
+    uint32_t bpp = type != GL_UNSIGNED_BYTE ? 0u : format == GL_RGBA ? 4u : format == GL_RGB ? 3u :
+                   format == GL_LUMINANCE_ALPHA ? 2u : (format == GL_LUMINANCE || format == GL_ALPHA) ? 1u : 0u;
+    if (tex_band_mode() && px && bpp && w > 0 && h > 1 && (uint64_t)w * (uint64_t)h * bpp > (uint64_t)TEX_BAND_BYTES) {
+        uint32_t row = (w * bpp + 3u) & ~3u;
+        uint32_t rows = TEX_BAND_BYTES / row;
+        uint32_t y;
+        if (rows < 1u) rows = 1u;
+        glTexImage2D(target, (GLint)level, (GLint)ifmt, (GLsizei)w, (GLsizei)h, (GLint)border, format, type, NULL);
+        for (y = 0; y < h; y += rows) {
+            uint32_t n = (h - y) < rows ? (h - y) : rows;
+            glTexSubImage2D(target, (GLint)level, 0, (GLint)y, (GLsizei)w, (GLsizei)n, format, type, px + (size_t)y * row);
+            ++g_tex_bands;
+        }
+        ++g_tex_banded;
+        return;
+    }
+    glTexImage2D(target, (GLint)level, (GLint)ifmt, (GLsizei)w, (GLsizei)h, (GLint)border, format, type, px);
+}
+/* the 2D texture bound on the active unit (0: none known) */
+static uint32_t tex2d_bound(void) {
+    uint32_t u = gls_unit_ok ? gls_unit - 0x84C0u : 0u;
+    return u < GLS_UNITS && gls_tex2d[u] ? gls_tex2d[u] - 1u : 0u;
+}
+/* every kept texture bound on some unit gets its pixels before a draw samples it */
+static void lazy_before_draw(void) {
+    uint32_t pending = 0;
+    isaac_lazy_tex_stats(&pending, NULL, NULL, NULL, NULL, NULL);
+    if (!pending) return;
+    for (unsigned u = 0; u < GLS_UNITS; ++u) {
+        uint32_t s = gls_tex2d[u];
+        if (s < 2u || !isaac_lazy_tex_pending(s - 1u)) continue;
+        uint32_t active = gls_unit_ok ? gls_unit : 0x84C0u;
+        if (active != 0x84C0u + u) glActiveTexture(0x84C0u + u);
+        isaac_lazy_tex_materialize(s - 1u, tex_upload);
+        if (active != 0x84C0u + u) glActiveTexture(active);
+        ++g_lazy_at_draw;
+    }
+}
+/* a kept texture that is not (or may not be) bound: bound on the active unit for
+ * its upload, then the unit's binding put back */
+static void lazy_materialize_unbound(uint32_t name) {
+    uint32_t prev = tex2d_bound();
+    if (prev != name) glBindTexture(GL_TEXTURE_2D, name);
+    isaac_lazy_tex_materialize(name, tex_upload);
+    if (prev != name) glBindTexture(GL_TEXTURE_2D, prev);
 }
 
 /* ---- the entry points ------------------------------------------------------ */
@@ -361,6 +424,7 @@ GLFN(glDeleteTextures) {
     ENTER;
     const GLuint *names = (const GLuint *)AP(1);
     for (uint32_t i = 0; names && i < A(0); ++i) {
+        isaac_lazy_tex_drop(names[i]);
         isaac_glc_tex_delete(names[i]);
         for (unsigned u = 0; u < GLS_UNITS; ++u) {
             if (gls_tex2d[u] == names[i] + 1u) gls_tex2d[u] = 0;
@@ -384,11 +448,13 @@ GLFN(glDisableVertexAttribArray) {
 }
 GLFN(glDrawArraysInstancedEXT) {
     ENTER;
+    lazy_before_draw();
     isaac_gl_draw_arrays_instanced(A(0), (GLint)A(1), (GLsizei)A(2), (GLsizei)A(3));
     RET0;
 }
 GLFN(glDrawElements) {
     ENTER;
+    lazy_before_draw();
     isaac_gl_draw_elements(A(0), (GLsizei)A(1), A(2), A(3));
     RET0;
 }
@@ -404,7 +470,7 @@ GLFN(glEnableVertexAttribArray) {
     RET0;
 }
 GLFN(glFramebufferRenderbuffer) { ENTER; isaac_glc_fbo_attach(A(0), A(1), 0, A(3), 0); glFramebufferRenderbuffer(A(0), A(1), A(2), A(3)); RET0; }
-GLFN(glFramebufferTexture2D) { ENTER; isaac_glc_fbo_attach(A(0), A(1), 1, A(3), (A(2) << 8) ^ A(4)); glFramebufferTexture2D(A(0), A(1), A(2), A(3), (GLint)A(4)); RET0; }
+GLFN(glFramebufferTexture2D) { ENTER; if (isaac_lazy_tex_pending(A(3))) { lazy_materialize_unbound(A(3)); ++g_lazy_at_attach; } isaac_glc_fbo_attach(A(0), A(1), 1, A(3), (A(2) << 8) ^ A(4)); glFramebufferTexture2D(A(0), A(1), A(2), A(3), (GLint)A(4)); RET0; }
 GLFN(glGenFramebuffers)      { ENTER; glGenFramebuffers((GLsizei)A(0), (GLuint *)AP(1)); RET0; }
 GLFN(glGenRenderbuffers)     { ENTER; glGenRenderbuffers((GLsizei)A(0), (GLuint *)AP(1)); RET0; }
 GLFN(glGenTextures)          { ENTER; glGenTextures((GLsizei)A(0), (GLuint *)AP(1)); RET0; }
@@ -626,34 +692,27 @@ GLFN(glTexImage2D) {
     ENTER;
     isaac_glc_tex_image(A(0));
     ++g_tex_uploads;
-    {
-        GLenum target = A(0), format = A(6), type = A(7);
-        GLsizei w = (GLsizei)A(3), h = (GLsizei)A(4);
-        const uint8_t *px = (const uint8_t *)AP(8);
-        uint32_t bpp = type != GL_UNSIGNED_BYTE ? 0u : format == GL_RGBA ? 4u : format == GL_RGB ? 3u :
-                       format == GL_LUMINANCE_ALPHA ? 2u : (format == GL_LUMINANCE || format == GL_ALPHA) ? 1u : 0u;
-        if (tex_band_mode() && px && bpp && w > 0 && h > 1 && (uint64_t)w * (uint64_t)h * bpp > (uint64_t)TEX_BAND_BYTES) {
-            uint32_t row = ((uint32_t)w * bpp + 3u) & ~3u;
-            uint32_t rows = TEX_BAND_BYTES / row;
-            GLsizei y;
-            if (rows < 1u) rows = 1u;
-            glTexImage2D(target, (GLint)A(1), (GLint)A(2), w, h, (GLint)A(5), format, type, NULL);
-            for (y = 0; y < h; y += (GLsizei)rows) {
-                GLsizei n = (h - y) < (GLsizei)rows ? (h - y) : (GLsizei)rows;
-                glTexSubImage2D(target, (GLint)A(1), 0, y, w, n, format, type, px + (size_t)y * row);
-                ++g_tex_bands;
-            }
-            ++g_tex_banded;
-            RET0;
+    if (A(0) == GL_TEXTURE_2D) {
+        uint32_t name = tex2d_bound();
+        /* round 97: a kept texture uploaded again: level 0 replaces what was kept,
+         * another level needs level 0 there first */
+        if (name && isaac_lazy_tex_pending(name)) {
+            if (A(1) == 0u) isaac_lazy_tex_drop(name);
+            else isaac_lazy_tex_materialize(name, tex_upload);
         }
+        if (name && isaac_lazy_tex_defer(name, A(0), A(1), A(2), A(3), A(4), A(5), A(6), A(7), (const uint8_t *)AP(8)))
+            RET0;
     }
-    glTexImage2D(A(0), (GLint)A(1), (GLint)A(2), (GLsizei)A(3), (GLsizei)A(4), (GLint)A(5),
-                 A(6), A(7), AP(8));
+    tex_upload(A(0), A(1), A(2), A(3), A(4), A(5), A(6), A(7), (const uint8_t *)AP(8));
     RET0;
 }
 GLFN(glTexParameteri)        { ENTER; glTexParameteri(A(0), A(1), (GLint)A(2)); RET0; }
 GLFN(glTexSubImage2D) {
     ENTER;
+    if (A(0) == GL_TEXTURE_2D) {                       /* round 97: written into: it needs its pixels first */
+        uint32_t name = tex2d_bound();
+        if (name && isaac_lazy_tex_materialize(name, tex_upload)) ++g_lazy_at_write;
+    }
     glTexSubImage2D(A(0), (GLint)A(1), (GLint)A(2), (GLint)A(3), (GLsizei)A(4), (GLsizei)A(5),
                     A(6), A(7), AP(8));
     RET0;

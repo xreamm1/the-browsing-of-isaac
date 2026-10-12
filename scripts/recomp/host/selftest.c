@@ -240,6 +240,97 @@ static void test_eh(void) {
 
 /* Round 94: a sliced job asleep until wake_ms sits out a frame at now_ms. */
 int isaac_threads_napping(double wake_ms, double now_ms);
+/* Round 97: textures that reach the GPU when first used (host_gl_lazy.c). The
+ * codec gives back exactly what it kept; the table keeps, gives back and drops. */
+static uint32_t g_up_calls, g_up_args[8];
+static uint8_t *g_up_px;
+static void lazy_capture(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h,
+                         uint32_t border, uint32_t format, uint32_t type, const uint8_t *px) {
+    uint32_t a[8] = { target, level, ifmt, w, h, border, format, type };
+    memcpy(g_up_args, a, sizeof a);
+    ++g_up_calls;
+    free(g_up_px);
+    g_up_px = (uint8_t *)malloc((size_t)w * h * 4u);
+    if (g_up_px) memcpy(g_up_px, px, (size_t)w * h * 4u);
+}
+static void test_lazy_textures(void) {
+    enum { W = 256, H = 256, N = W * H };
+    uint8_t *glyph = (uint8_t *)calloc(N, 4), *sprite = (uint8_t *)calloc(N, 4), *noise = (uint8_t *)malloc(N * 4);
+    uint8_t *back = (uint8_t *)malloc(N * 4), *code = (uint8_t *)malloc(N * 8);
+    uint32_t seed = 12345u;
+    for (int i = 0; i < N * 4; ++i) { seed = seed * 1103515245u + 12345u; noise[i] = (uint8_t)(seed >> 16); }
+    /* a glyph page: premultiplied white, antialiased edges, rows of nothing between */
+    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
+        int cell = ((y % 32) < 24 && (x % 16) < 12 && ((x / 16 + y / 32) % 3));
+        uint8_t a = cell ? (uint8_t)(((x * 37 + y * 11) % 255) | 1) : 0;
+        memset(glyph + (y * W + x) * 4, a, 4);
+    }
+    /* a sprite sheet: colour, mostly transparent */
+    for (int y = 40; y < 90; ++y) for (int x = 30; x < 120; ++x) {
+        uint8_t *p = sprite + (y * W + x) * 4;
+        p[0] = (uint8_t)(x * 2); p[1] = (uint8_t)(y * 3); p[2] = 77; p[3] = 255;
+    }
+    check(isaac_lazy_gray(glyph, N) && !isaac_lazy_gray(sprite, N) && !isaac_lazy_gray(noise, N),
+          "lazy textures: a premultiplied white glyph page is gray, a colour sprite and noise are not");
+    size_t lg = isaac_lazy_encode(glyph, N, 1, NULL), ls = isaac_lazy_encode(sprite, N, 0, NULL), ln = isaac_lazy_encode(noise, N, 0, NULL);
+    check(lg < (size_t)N * 2 && ls < (size_t)N && ln > (size_t)N * 2,
+          "lazy textures: the glyph page and the sprite code under half their RGBA, noise does not");
+    check(isaac_lazy_encode(glyph, N, 1, code) == lg && isaac_lazy_decode(code, lg, 1, back, N) && !memcmp(back, glyph, N * 4),
+          "lazy textures: the glyph page comes back exactly (one byte per pixel)");
+    check(isaac_lazy_encode(sprite, N, 0, code) == ls && isaac_lazy_decode(code, ls, 0, back, N) && !memcmp(back, sprite, N * 4),
+          "lazy textures: the sprite comes back exactly (whole pixels)");
+    check(isaac_lazy_encode(noise, N, 0, code) == ln && isaac_lazy_decode(code, ln, 0, back, N) && !memcmp(back, noise, N * 4),
+          "lazy textures: noise comes back exactly too (literal runs)");
+    {   /* runs at both ends, of every length around the repeat threshold */
+        uint8_t edge[64 * 4];
+        for (int i = 0; i < 64; ++i) { uint8_t v = (uint8_t)(i < 3 ? 9 : i < 5 ? 1 : i < 13 ? 2 : i < 20 ? i : 200); memset(edge + i * 4, v, 4); }
+        size_t le = isaac_lazy_encode(edge, 64, 1, code);
+        uint8_t eb[64 * 4];
+        check(isaac_lazy_decode(code, le, 1, eb, 64) && !memcmp(eb, edge, sizeof edge), "lazy textures: short and long runs at both ends");
+        size_t lc = isaac_lazy_encode(edge, 64, 0, code);
+        check(isaac_lazy_decode(code, lc, 0, eb, 64) && !memcmp(eb, edge, sizeof edge), "lazy textures: the same as whole pixels");
+        check(!isaac_lazy_decode(code, lc - 1, 0, eb, 64) && !isaac_lazy_decode(code, lc, 0, eb, 63) && !isaac_lazy_decode(code, lc, 0, eb, 65),
+              "lazy textures: a cut code, or a code for another size, is refused");
+        /* a code for more pixels than the buffer holds is refused before it writes past it */
+        uint8_t small[48 * 4 + 16];
+        memset(small, 0xA5, sizeof small);
+        size_t lw = isaac_lazy_encode(edge, 64, 0, code);
+        int ok = isaac_lazy_decode(code, lw, 0, small, 48), guard = 1;
+        for (size_t g = 48 * 4; g < sizeof small; ++g) guard &= small[g] == 0xA5;
+        check(!ok && guard, "lazy textures: a code longer than the texture never writes past it");
+    }
+    /* the table */
+    uint32_t pending, deferred, materialized, refused;
+    uint64_t held, raw;
+    check(isaac_lazy_tex_defer(7, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, glyph), "lazy textures: a 256 KB glyph page is kept");
+    check(isaac_lazy_tex_pending(7) && !isaac_lazy_tex_pending(8), "lazy textures: it is pending under its name");
+    isaac_lazy_tex_stats(&pending, &deferred, &materialized, &refused, &held, &raw);
+    check(pending == 1 && held == lg && raw == (uint64_t)N * 4, "lazy textures: its code is what is held");
+    check(!isaac_lazy_tex_defer(9, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, noise), "lazy textures: noise is uploaded at once");
+    check(!isaac_lazy_tex_defer(10, 0x0DE1, 0, 0x1908, 64, 64, 0, 0x1908, 0x1401, glyph), "lazy textures: under 64 KB too");
+    check(!isaac_lazy_tex_defer(11, 0x0DE1, 1, 0x1908, W, H, 0, 0x1908, 0x1401, glyph) &&
+          !isaac_lazy_tex_defer(11, 0x0DE1, 0, 0x1907, W, H, 0, 0x1907, 0x1401, glyph) &&
+          !isaac_lazy_tex_defer(0, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, glyph) &&
+          !isaac_lazy_tex_defer(11, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, NULL),
+          "lazy textures: another level, RGB, the default texture or no pixels are uploaded at once");
+    g_up_calls = 0;
+    check(isaac_lazy_tex_materialize(7, lazy_capture) && g_up_calls == 1 && !isaac_lazy_tex_pending(7),
+          "lazy textures: on first use the upload is made once and the copy is freed");
+    check(g_up_args[0] == 0x0DE1 && g_up_args[1] == 0 && g_up_args[2] == 0x1908 && g_up_args[3] == W && g_up_args[4] == H &&
+          g_up_args[5] == 0 && g_up_args[6] == 0x1908 && g_up_args[7] == 0x1401 && g_up_px && !memcmp(g_up_px, glyph, N * 4),
+          "lazy textures: with the kept call's arguments and exactly its pixels");
+    check(!isaac_lazy_tex_materialize(7, lazy_capture) && g_up_calls == 1, "lazy textures: a second use uploads nothing");
+    check(isaac_lazy_tex_defer(12, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, glyph) &&
+          isaac_lazy_tex_defer(12, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, sprite), "lazy textures: a name uploaded twice keeps the second");
+    isaac_lazy_tex_stats(&pending, NULL, NULL, NULL, &held, NULL);
+    check(pending == 1 && held == ls, "lazy textures: and holds only the second");
+    check(isaac_lazy_tex_materialize(12, lazy_capture) && !memcmp(g_up_px, sprite, N * 4), "lazy textures: whose pixels it gives back");
+    check(isaac_lazy_tex_defer(13, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, sprite), "lazy textures: kept again");
+    isaac_lazy_tex_drop(13);
+    isaac_lazy_tex_stats(&pending, NULL, NULL, NULL, &held, &raw);
+    check(!isaac_lazy_tex_pending(13) && pending == 0 && held == 0 && raw == 0, "lazy textures: a deleted texture's copy is dropped");
+    free(glyph); free(sprite); free(noise); free(back); free(code); free(g_up_px); g_up_px = NULL;
+}
 static void test_thread_naps(void) {
     check(!isaac_threads_napping(0.0, 100.0), "thread naps: a job that never slept runs every frame");
     check(isaac_threads_napping(150.0, 100.0), "thread naps: a job whose Sleep ends at 150 sits out the frame at 100");
@@ -451,6 +542,7 @@ static int selftest_fs_read_is(uint32_t scratch, const char *path,
 int main(int argc, char **argv) {
     test_render_gate();
     test_thread_naps();
+    test_lazy_textures();
     test_eh();
     printf("--- isaac host layer selftest ---\n");
     if (argc > 1) load_image(argv[1]);

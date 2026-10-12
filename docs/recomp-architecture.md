@@ -9194,3 +9194,61 @@ windows for returning visits would remove it.
 Also passing on the candidate: `sound-check.mjs` (31 sounds played, output
 level 0.145, no complaint in the game's log), live-proof, and `run-start.mjs`
 (the run-start freeze 617 ms). Not deployed: stream B is a new 367 MB upload.
+
+### 21.126 Round 97: a texture reaches the GPU when it is first used
+
+**What the GPU held.** A census of the page's own WebGL calls (`tex-census.mjs`,
+`tex-use.mjs`: live textures by level size, and whether a draw ran while each was
+bound) found 575 textures alive at the title, 257.7 MB of RGBA. **566 of them,
+235 MB, had never been drawn with.** After a minute of play it was 614 of 633,
+239 of 308 MB. The engine decodes and uploads nearly every sprite sheet and font
+page at boot, and draws with a few at a time.
+
+Four of the five largest are CJK font pages, by their pixels (`tex-dump.mjs`):
+
+- a 4096x4096 (64 MB), never drawn in an English game;
+- a 4096x2048 (32 MB), which IS drawn in play, so blanking the art would have
+  broken text;
+- two 2048x2048 (16 MB each).
+
+On a phone, all of this is the system's RAM.
+
+**What changed.** `host_gl_lazy.c` keeps a large RGBA upload's pixels (64 KB and
+up) instead of forwarding it, coded small:
+
+- **The code.** Tokens of a u32 header, repeat or literal. A value is one byte
+  where every pixel is premultiplied gray (r == g == b == a: a white glyph
+  page), else a whole pixel.
+- **Measured.** On the never-drawn textures, 235 MB of RGBA codes to 45 MB:
+  glyph pages to 26-31%, sprite sheets under 10%.
+- **The refusal.** A texture whose code would exceed half its RGBA is uploaded
+  as before.
+
+`host_gl_webgl.c` gives a kept texture its pixels the first time it can be seen:
+a draw while it is bound on any unit, a `glTexSubImage2D` into it, a framebuffer
+attachment, or an upload of another level. A bind alone does not, because the
+loader binds, uploads and may bind again, and only a draw samples. A deleted
+texture's copy is dropped, and a level-0 re-upload replaces it.
+`ISAAC_GL_LAZY_TEX=0` turns it off; `ISAAC_GL_LAZY_MIN` sets the threshold.
+
+| | release 14 | lazy textures |
+|---|---|---|
+| live texture memory at the title | 257.7 MB | **32.2 MB** |
+| after a minute of play | 308.1 MB | **79.6 MB** |
+| host heap peak (the kept codes) | 128 MiB | 188 MiB |
+| stage-8 scene, CPU x1 | 59.8 fps | 59.5-59.8 fps |
+
+The host's peak rose by the kept codes, so `-sINITIAL_MEMORY` is **704 MiB**
+again; at 640 the host had 192.
+
+**Checked.**
+
+- **Selftest.** 23 checks on the codec and the table: exact round trips (glyph
+  page, sprite, noise, runs at both ends), the refusals (noise, under 64 KB,
+  another level, RGB, the default texture, no pixels), keep/give/replace/drop,
+  a corrupt or overlong code refused without writing past the buffer.
+  7 mutants were killed.
+- **In the browser.** live-proof, `sound-check.mjs` (31 sounds), `run-start.mjs`
+  and `pad-check.mjs` 8/8 pass. Screenshots of the title (menu text drawn from a
+  kept glyph page) and of the stage-8 room look right.
+- **Still to do before it ships:** a real-WebGL test of the draw-time path.

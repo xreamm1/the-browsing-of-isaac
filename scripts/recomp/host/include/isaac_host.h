@@ -410,6 +410,23 @@ int  isaac_eh_plan(uint32_t fs0, uint32_t throwinfo, uint32_t esp_limit, isaac_e
 int  isaac_eh_tail(uint32_t cont, isaac_cpu *c);
 void isaac_eh_throw(isaac_cpu *restrict cpu);
 
+/* host_gl_lazy.c (round 97): a large texture reaches the GPU when first used.
+ * The upload callback receives the deferred glTexImage2D's arguments. */
+typedef void (*isaac_lazy_upload_fn)(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h,
+                                     uint32_t border, uint32_t format, uint32_t type, const uint8_t *px);
+int    isaac_lazy_tex_enabled(void);
+int    isaac_lazy_gray(const uint8_t *px, uint32_t npix);
+size_t isaac_lazy_encode(const uint8_t *px, uint32_t npix, int gray, uint8_t *out);
+int    isaac_lazy_decode(const uint8_t *code, size_t len, int gray, uint8_t *px, uint32_t npix);
+int    isaac_lazy_tex_pending(uint32_t name);
+void   isaac_lazy_tex_drop(uint32_t name);
+int    isaac_lazy_tex_defer(uint32_t name, uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h,
+                            uint32_t border, uint32_t format, uint32_t type, const uint8_t *px);
+int    isaac_lazy_tex_materialize(uint32_t name, isaac_lazy_upload_fn up);
+void   isaac_lazy_tex_stats(uint32_t *pending, uint32_t *deferred, uint32_t *materialized, uint32_t *refused,
+                            uint64_t *held, uint64_t *raw_pending);
+void   isaac_lazy_tex_report(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -142,7 +142,11 @@ LDFLAGS = [
     # grew. A larger need (many mods: their files are seeded into the host
     # heap) grows the memory, which the page survives (measured from 560 MiB:
     # it grew to 657 and played), at a few per cent of frame time.
-    "-sINITIAL_MEMORY=671088640",
+    # Round 97: 704 MiB again. The lazy textures (host_gl_lazy.c) keep the
+    # never-drawn textures' pixels in the host heap, coded (~45-60 MB), and
+    # the host's peak rose from 128 to 188 MiB -- at 640 the host had 192.
+    # The textures they keep off the GPU are 225 MB at the title.
+    "-sINITIAL_MEMORY=738197504",
     "-sMAXIMUM_MEMORY=4294967296",
     "-sALLOW_MEMORY_GROWTH=1",
     "-sGLOBAL_BASE=469762048",
