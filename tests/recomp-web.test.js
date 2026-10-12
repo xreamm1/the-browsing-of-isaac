@@ -118,10 +118,12 @@ test('round 37: the web GL wrappers answer from the host cache, the present drai
   assert.ok(gl.includes('if (gl_check_mode() || (g_present_count & 63u) == 1u) {'),
     'the present drains glGetError every 64th frame unless ISAAC_GL_CHECK=1');
   const win = readFileSync(join(hostSrc, 'host_shims_win.c'), 'utf8');
-  assert.ok(/if \(isaac_web_yield_enabled\(\)\) \{\s*int waited = isaac_yield_js\(\);/.test(win), 'SwapBuffers yields through isaac_yield_js');
-  const yieldStart = win.indexOf('EM_ASYNC_JS(int, isaac_yield_js, (void), {');
-  assert.ok(yieldStart > 0, 'the yield answers whether it waited (round 93)');
+  assert.ok(/if \(isaac_web_yield_enabled\(\)\) \{\s*static double resumed_at;\s*int waited = isaac_yield_js\(/.test(win), 'SwapBuffers yields through isaac_yield_js');
+  const yieldStart = win.indexOf('EM_ASYNC_JS(int, isaac_yield_js, (double work), {');
+  assert.ok(yieldStart > 0, 'the yield answers whether it waited (round 93), from the work the host measured (round 97)');
   const yieldBody = win.slice(yieldStart, win.indexOf('/* ISAAC_YIELD=1:'));
+  assert.ok(!yieldBody.includes('isaacYieldResumed') && !yieldBody.includes('performance.now()'),
+    'round 97: the page no longer times the pass itself (that clock counted the frame limiter\'s Sleep as work)');
   assert.ok(yieldBody.includes('var waited = 1;') && /waited = 0;\s*if \(!Module\.isaacYieldChannel\) \{/.test(yieldBody)
     && yieldBody.includes('return waited;'), 'only the MessageChannel yield reports that it did not wait');
   assert.ok(yieldBody.includes('new MessageChannel()') && yieldBody.includes('port2.postMessage(0)'),
@@ -157,7 +159,7 @@ test('round 93: main\'s in-between render asks the render gate, and a skipped fr
     && skipped.indexOf('isaac_render_gate_resumed(emscripten_get_now());') > skipped.indexOf('emscripten_sleep((unsigned)(g_rg_wait + 0.5))'),
     'a skipped frame pumps the audio thread and the thread jobs, waits, then marks the resume');
   const swap = win.slice(win.indexOf('void imp_gdi32__SwapBuffers(CpuState *restrict cpu) {'));
-  assert.ok(swap.indexOf('isaac_render_gate_presenting(now);') > 0 && swap.indexOf('isaac_render_gate_presenting(now);') < swap.indexOf('int waited = isaac_yield_js();'),
+  assert.ok(swap.indexOf('isaac_render_gate_presenting(now);') > 0 && swap.indexOf('isaac_render_gate_presenting(now);') < swap.indexOf('int waited = isaac_yield_js('),
     'the present times the render before it yields');
   assert.ok(swap.includes('if (!waited && pace >= 1.0) {'), 'a drawn in-between frame is paced only when its present did not wait for the browser');
   const st = readFileSync(join(root, 'scripts', 'recomp', 'host', 'selftest.c'), 'utf8');
@@ -174,7 +176,7 @@ test('round 94: the footstep\'s 1x1 readback is answered from the previous read 
     'with a completed read in hand: answer with it, then start the next');
   assert.ok(/glReadPixels\(\(GLint\)A\(0\), \(GLint\)A\(1\), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, dst\);\s*memcpy\(g_rp_px, dst, 4\);\s*g_rp_have = 1;/.test(body),
     'with none yet: the one synchronous read, kept as the answer to come');
-  assert.ok(body.trimEnd().endsWith('glReadPixels((GLint)A(0), (GLint)A(1), (GLsizei)A(2), (GLsizei)A(3), A(4), A(5), AP(6));\n    RET0;\n}'),
+  assert.ok(body.replace(/\r\n/g, '\n').trimEnd().endsWith('glReadPixels((GLint)A(0), (GLint)A(1), (GLsizei)A(2), (GLsizei)A(3), A(4), A(5), AP(6));\n    RET0;\n}'),
     'any other read is synchronous, as before');
   const issue = gl.slice(gl.indexOf('static void rp_issue(GLint x, GLint y) {'));
   const ib = issue.slice(0, issue.indexOf('\n}'));
@@ -466,8 +468,12 @@ test('round 60: after the boot the reader Worker drops what it fetched ahead and
 test('round 60: a large texture upload goes in bands, so the GL transfer chunk never grows past 4 MB', () => {
   const g = readFileSync(join(root, 'scripts', 'recomp', 'host', 'src', 'host_gl_webgl.c'), 'utf8');
   assert.ok(g.includes('#define TEX_BAND_BYTES (4u << 20)') && g.includes('getenv("ISAAC_GL_TEX_BAND")'), 'the band size and the A/B switch');
-  assert.ok(g.includes('glTexImage2D(target, (GLint)A(1), (GLint)A(2), w, h, (GLint)A(5), format, type, NULL);') && g.includes('glTexSubImage2D(target, (GLint)A(1), 0, y, w, n, format, type, px + (size_t)y * row);'), 'a null allocation, then rows');
-  assert.ok(g.includes('uint32_t row = ((uint32_t)w * bpp + 3u) & ~3u;'), 'rows at the default unpack alignment');
+  // round 97 moved the bands into tex_upload(), shared by glTexImage2D and a lazy texture's first use
+  const up = g.slice(g.indexOf('static void tex_upload('), g.indexOf('/* the 2D texture bound on the active unit'));
+  assert.ok(up.includes('glTexImage2D(target, (GLint)level, (GLint)ifmt, (GLsizei)w, (GLsizei)h, (GLint)border, format, type, NULL);')
+    && up.includes('glTexSubImage2D(target, (GLint)level, 0, (GLint)y, (GLsizei)w, (GLsizei)n, format, type, px + (size_t)y * row);'), 'a null allocation, then rows');
+  assert.ok(up.includes('uint32_t row = (w * bpp + 3u) & ~3u;'), 'rows at the default unpack alignment');
+  assert.ok(/GLFN\(glTexImage2D\) \{[^]*?tex_upload\(A\(0\), A\(1\), A\(2\), /.test(g), 'glTexImage2D uploads through it');
   assert.ok(g.includes('texture uploads: %u, %u of them in bands of %u MB (%u bands)%s'), 'the census line');
   const b = readFileSync(join(root, 'scripts', 'recomp', 'web', 'boot_web.mjs'), 'utf8');
   assert.ok(b.includes("dropBody(blob);                                           // round 60: this frame lives as long as main() does"), 'the placed image\'s bytes are dropped');

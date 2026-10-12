@@ -70,8 +70,9 @@ test('SwapBuffers hands the frame to the browser: one JSPI suspension per presen
   const win = readFileSync(join(hostSrc, 'host_shims_win.c'), 'utf8');
   const fn = win.slice(win.indexOf('void imp_gdi32__SwapBuffers(CpuState *restrict cpu) {'));
   const body = fn.slice(0, fn.indexOf('\n}') + 2);
-  assert.ok(/#ifdef ISAAC_WEB\s*\/\*[^]*?\*\/\s*if \(isaac_web_yield_enabled\(\)\) \{\s*int waited = isaac_yield_js\(\);[^]*?isaac_render_gate_resumed\(t\);\s*\}\s*#endif\s*\}$/.test(body),
-    'the yield is the last thing SwapBuffers does (then round 93\'s pace), under ISAAC_WEB, gated on the runtime switch');
+  assert.ok(/#ifdef ISAAC_WEB\s*\/\*[^]*?\*\/\s*if \(isaac_web_yield_enabled\(\)\) \{\s*static double resumed_at;\s*int waited = isaac_yield_js\(isaac_yield_work_ms\(emscripten_get_now\(\), resumed_at, isaac_yield_take_slept\(\)\)\);\s*double t = emscripten_get_now\(\);\s*resumed_at = t;[^]*?isaac_render_gate_resumed\(t\);\s*\}\s*#endif\s*\}$/.test(body),
+    'the yield is the last thing SwapBuffers does (then round 93\'s pace), under ISAAC_WEB, gated on the runtime switch; '
+    + 'round 97: its work runs from the last resume, less the main thread\'s sleeps');
   assert.ok(body.indexOf('isaac_threads_slice(cpu); }') < body.indexOf('emscripten_sleep(0)'),
     'the thread slices run before the frame is handed over');
   assert.ok(body.indexOf('cpu->EAX = 1;') < body.indexOf('emscripten_sleep(0)'), 'the return value is set before suspending');
@@ -92,8 +93,10 @@ test('Sleep is a real wall-clock wait when interactive, never from a thread slic
   assert.ok(helper.length > 0, 'the helper exists');
   assert.ok(fwd.lastIndexOf('#ifdef ISAAC_WEB', fwd.indexOf('static void sleep_yield_web')) > fwd.indexOf('void imp_kernel32__QueryPerformanceFrequency'),
     'the helper is under ISAAC_WEB');
-  assert.ok(/if \(ms && isaac_web_yield_enabled\(\) && !isaac_threads_slicing\(\)\)\s*emscripten_sleep\(ms > 50u \? 50u : ms\);/.test(helper.slice(0, 400)),
+  assert.ok(/if \(ms && isaac_web_yield_enabled\(\) && !isaac_threads_slicing\(\)\) \{\s*double t0 = emscripten_get_now\(\);\s*emscripten_sleep\(ms > 50u \? 50u : ms\);/.test(helper.slice(0, 700)),
     'guarded on the runtime switch AND on not being inside a slice; capped at 50 ms');
+  assert.ok(/emscripten_sleep\(ms > 50u \? 50u : ms\);\s*\/\*[^]*?\*\/\s*isaac_render_gate_slept\(emscripten_get_now\(\) - t0\);\s*\}\s*\}/.test(helper.slice(0, 700)),
+    'round 97: the wait it slept is reported, so neither the render gate nor the present\'s yield counts it as work');
   assert.ok(fwd.includes('#define sleep_yield_web(ms) ((void)(ms))'), 'a no-op in the node profile');
   const sleep = fwd.slice(fwd.indexOf('void imp_kernel32__Sleep(CpuState *restrict cpu) {'));
   const body = sleep.slice(0, sleep.indexOf('\n}') + 2);

@@ -122,6 +122,10 @@ static void check(int cond, const char *what) {
 /* Round 93: the render gate (host_shims_win.c), driven with exact instants. */
 void isaac_render_gate_reset(void);
 void isaac_render_gate_resumed(double now_ms);
+void isaac_render_gate_slept(double ms);
+double isaac_render_gate_update_ms(void);
+double isaac_yield_take_slept(void);
+double isaac_yield_work_ms(double now_ms, double resumed_ms, double slept_ms);
 void isaac_render_gate_presenting(double now_ms);
 int isaac_render_gate_decide(double now_ms, int have_game, uint32_t game_ticks);
 uint32_t isaac_render_gate_skipped(void);
@@ -436,6 +440,34 @@ static void test_render_gate(void) {
     check(isaac_render_gate_decide(367.0, 1, 4u) == 0, "render gate (pace): drawn once more");
     check(isaac_render_gate_decide(370.0, 0, 0u) == 0 && isaac_render_gate_pace_ms(371.0) == 0.0,
           "render gate (pace): leaving the Game drops a pending pace");
+
+    /* round 97: on a display faster than 66 Hz the game's own frame limiter
+     * (main, 0x0093134d) pads each pass to 1/60 s with Sleep after the present,
+     * between the resume and the next update: waiting, not update work */
+    isaac_render_gate_reset();
+    isaac_render_gate_slept(995.0);                      /* no resume yet: nothing to move */
+    check(isaac_render_gate_decide(1000.0, 1, 1u) == 0, "render gate (limiter): first sighting");
+    check(isaac_render_gate_decide(1005.0, 1, 2u) == 0 && isaac_render_gate_update_ms() == 0.0,
+          "render gate (limiter): a sleep before any resume measures no update");
+    isaac_render_gate_resumed(1010.0);
+    isaac_render_gate_slept(9.0);                        /* the limiter's Sleep */
+    check(isaac_render_gate_decide(1024.0, 1, 3u) == 0 && isaac_render_gate_update_ms() == 5.0,
+          "render gate (limiter): the tick's update is 1024 - 1010 - 9 slept = 5 ms, not 14");
+    isaac_render_gate_presenting(1027.0);                /* render 3 ms */
+    isaac_render_gate_resumed(1030.0);
+    isaac_render_gate_slept(7.0);
+    check(isaac_render_gate_decide(1041.0, 1, 3u) == 0,
+          "render gate (limiter): the in-between frame is drawn (1041 - 1024 + render 3 + update 5 = 25; with the sleep, 34: skipped)");
+    /* the present's yield: a pass under 15 ms of work waits for the browser's frame */
+    (void)isaac_yield_take_slept();
+    isaac_render_gate_slept(4.0);
+    isaac_render_gate_slept(5.0);
+    isaac_render_gate_slept(-3.0);                       /* a clock that stepped back slept nothing */
+    check(isaac_yield_take_slept() == 9.0 && isaac_yield_take_slept() == 0.0,
+          "yield (limiter): the main thread's sleeps since the last present add up to 9 ms, taken once");
+    check(isaac_yield_work_ms(120.0, 100.0, 9.0) == 11.0,
+          "yield (limiter): the pass worked 120 - 100 - 9 slept = 11 ms, under 15: it waits for the browser's frame");
+    check(isaac_yield_work_ms(120.0, 0.0, 9.0) == 1e9, "yield: before any present resumed, a pass reads as long");
 }
 
 /* Round 36: the OpenAL model (host_audio.c) advances on THIS clock in the

@@ -663,10 +663,9 @@ int isaac_editfile_gate(uint32_t menu_va) {
 }
 
 /* returns 1 when the frame waited (for the browser's frame, or the hidden
- * page's timer), 0 when it only yielded (round 93's render gate paces those) */
-EM_ASYNC_JS(int, isaac_yield_js, (void), {
-    var now = performance.now();
-    var work = Module.isaacYieldResumed ? now - Module.isaacYieldResumed : 1e9;
+ * page's timer), 0 when it only yielded (round 93's render gate paces those);
+ * work: the pass's time since the last present resumed (isaac_yield_work_ms) */
+EM_ASYNC_JS(int, isaac_yield_js, (double work), {
     var waited = 1;
     if (typeof document !== "undefined" && document.hidden) {
         await new Promise(function (resolve) { setTimeout(resolve, 250); });
@@ -698,7 +697,6 @@ EM_ASYNC_JS(int, isaac_yield_js, (void), {
             Module.isaacYieldChannel.port2.postMessage(0);
         });
     }
-    Module.isaacYieldResumed = performance.now();
     return waited;
 });
 /* ISAAC_YIELD=1: the web build yields to the event loop per frame and paces
@@ -772,6 +770,28 @@ void isaac_render_gate_reset(void) {
 }
 /* when the loop resumed after a present (or a skipped one): the next update's start */
 void isaac_render_gate_resumed(double now_ms) { g_rg_resume = now_ms; }
+/* Round 97: the main thread slept (kernel32 Sleep): waiting, not update work.
+ * On a display faster than 66 Hz the game turns its own frame limiter back on
+ * (main, 0x0093134d: the pass is padded to 1/60 s with Sleep after the present),
+ * and that sleep fell inside the update the gate measures from the resume: on a
+ * 164 Hz screen the update read 17 ms against a real 5, the gate skipped nearly
+ * every in-between frame, and the game showed 30 fps. The resume moves past it.
+ * The present's yield reads its pass's work the same way (isaac_yield_work_ms):
+ * counting the sleep, a limited pass never waited for the browser's frame, and
+ * the gate's pace then slept past the limiter's deadline (58 fps, not 60). */
+static double g_slept_since_yield;
+void isaac_render_gate_slept(double ms) {
+    if (ms <= 0.0) return;
+    g_slept_since_yield += ms;
+    if (g_rg_resume > 0.0) g_rg_resume += ms;
+}
+/* the main thread's sleeps since the last present's yield, taken once */
+double isaac_yield_take_slept(void) { double s = g_slept_since_yield; g_slept_since_yield = 0.0; return s; }
+/* a pass's work before its present: the time since the last present resumed,
+ * less the main thread's sleeps; none resumed yet reads as a long pass */
+double isaac_yield_work_ms(double now_ms, double resumed_ms, double slept_ms) {
+    return resumed_ms > 0.0 ? now_ms - resumed_ms - slept_ms : 1e9;
+}
 /* a present begins: the render drawn since the gate said draw cost this much */
 void isaac_render_gate_presenting(double now_ms) {
     if (g_rg_draw_at > 0.0) {
@@ -955,8 +975,10 @@ void imp_gdi32__SwapBuffers(CpuState *restrict cpu) {
      * stack resumes on the next macrotask. Off unless ISAAC_YIELD=1, so the
      * headless runner keeps its as-fast-as-possible behaviour. */
     if (isaac_web_yield_enabled()) {
-        int waited = isaac_yield_js();
+        static double resumed_at;
+        int waited = isaac_yield_js(isaac_yield_work_ms(emscripten_get_now(), resumed_at, isaac_yield_take_slept()));
         double t = emscripten_get_now();
+        resumed_at = t;
         if (waited) ++g_rg_presents_waited; else ++g_rg_presents_yielded;
         /* round 93: a drawn in-between frame that did not wait for the
          * browser's frame may not bring the next tick early */

@@ -448,8 +448,13 @@ void imp_kernel32__QueryPerformanceFrequency(CpuState *restrict cpu) {
  * 50 ms so a long guest sleep cannot freeze the page. */
 static void sleep_yield_web(uint32_t ms) {
     extern int isaac_web_yield_enabled(void), isaac_threads_slicing(void);
-    if (ms && isaac_web_yield_enabled() && !isaac_threads_slicing())
+    extern void isaac_render_gate_slept(double ms);
+    if (ms && isaac_web_yield_enabled() && !isaac_threads_slicing()) {
+        double t0 = emscripten_get_now();
         emscripten_sleep(ms > 50u ? 50u : ms);
+        /* round 97: a main-thread sleep is not work, to the render gate or the present's yield */
+        isaac_render_gate_slept(emscripten_get_now() - t0);
+    }
 }
 #else
 #define sleep_yield_web(ms) ((void)(ms))

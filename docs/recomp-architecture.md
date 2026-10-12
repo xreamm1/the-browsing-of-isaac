@@ -9252,3 +9252,90 @@ again; at 640 the host had 192.
   and `pad-check.mjs` 8/8 pass. Screenshots of the title (menu text drawn from a
   kept glyph page) and of the stage-8 room look right.
 - **Still to do before it ships:** a real-WebGL test of the draw-time path.
+
+### 21.127 Round 97b: a display faster than 66 Hz played at 30 fps
+
+**The report.** The player saw 30 fps in play where they used to see 60, on
+tboi.online (release 13) and on GitHub Pages (release 14) alike. Headless runs
+here, at 60 Hz, gave 59.7 fps for both. This PC's own screen runs at 164 Hz,
+and a headed run there (`hz-play.mjs`, `?ISAAC_RENDER_GATE=2`) reproduced it:
+158.5 animation frames a second, **30.7 presented**, 28.6 ticks. The gate had
+skipped 134 of 150 in-between frames, and it read the update at 17.2 ms.
+
+**The cause: the game's own frame limiter.**
+
+- **When it runs.** main turns the limiter on when a pass runs above 1.1 x 60
+  fps for more than 30 passes in a row (0x009312af..0x009312c5). That happens
+  on any display faster than 66 Hz.
+- **What it does.** After each present (0x0093134d) it pads the pass to 1/60 s.
+  It calls `Sleep(floor(left ms) - 1)` (0x009313cc; the clock is
+  `0x00a266a0`; 1/60 s and -1000.0 are at `0xbaa498` and `0xbaad98`), then
+  spins on the clock to the deadline.
+- **Why the gate broke.** That sleep falls between the present's resume and
+  the next update, and the render gate (round 93) times the update from the
+  resume. It counted the sleep: 17 ms of "update" against a real 2. Every
+  in-between frame then looked as if it would make the next tick late, so it
+  was skipped.
+- **Since release 11.** A 60 Hz screen never shows it: with VSync=1 the limiter
+  stays off.
+
+**The same defect, a second time.** The present's yield (`isaac_yield_js`)
+waits for the browser's frame only when the pass did under 15 ms of work. The
+page timed that work from the last resume, so the limiter's sleep counted
+here too. A limited pass therefore never waited. The gate then paced each
+drawn in-between frame with its own sleep to the next tick, and that sleep
+overshot the limiter's deadline. With the first fix alone the screen showed
+58.1 fps.
+
+**The fix.** The Sleep shim times its wait on the main thread and reports it
+(`isaac_render_gate_slept`). Both measurements now leave it out:
+
+- the gate's resume moves past the sleep;
+- the yield's work is measured by the host: from the last resume, less the
+  sleeps (`isaac_yield_work_ms`, `isaac_yield_take_slept`).
+
+The gate's own paces and skip waits count as before, so nothing changes where
+the limiter is off.
+
+| 164 Hz screen, 20 s of play | presented / s | ticks / s | in-between frames skipped | presents that waited for the frame |
+|---|---|---|---|---|
+| release 14 | 32.4 | 29.6 | 120 and 145 of 150 | 11 of 180, 0 of 155 |
+| the gate fix alone | 58.1 | 29.1 | 0 | 30 of 300 (130 paces) |
+| the gate and the yield fix | **59.0** | 29.6 | 0 | 300 of 300 (no pace) |
+
+With both fixes a tick comes every 33.48 ms on average (59.7 fps between room
+loads). The limiter's own `Sleep` can still wake past its deadline: its margin
+is 1 to 2 ms.
+
+**Other displays and devices.**
+
+- **Uncapped animation frames** (`--disable-gpu-vsync
+  --disable-frame-rate-limit`): 57.7 presented, 28.9 ticks, nothing skipped.
+- **60 Hz, headless, stage-8 scene:**
+
+| | fps | ticks in 15 s |
+|---|---|---|
+| release 14 | 60 | 451 |
+| the fix | 60 | 450 |
+
+- **CPU x4, two pairs:**
+
+| | fps | ticks in 15 s |
+|---|---|---|
+| release 14 | 29.3, 27.9 | 432, 421 |
+| the fix | 31.5, 30.1 | 445, 438 |
+
+**Checked.**
+
+- **Selftest.** 7 checks: the update leaves the sleep out; the in-between
+  frame is drawn; the sleeps add up and are taken once; the yield's work; no
+  update before any resume.
+- **Mutants.** 7 mutants of the host logic were killed. So were 4 mutants of
+  the source pins in `tests/recomp-jspi.test.js` and `tests/recomp-web.test.js`.
+  Those two files also carried two stale pins from 21.126, now repaired: the
+  bands moved into `tex_upload()`, and a CRLF working copy broke an
+  `endsWith`.
+
+**Shipped** as release 15: release 14's sources (005db8f) with only this
+change, built from a worktree (`.scratch/r97/build_engine_wt.py`). The lazy
+textures (21.126) are not in it.
