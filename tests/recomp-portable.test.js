@@ -93,6 +93,7 @@ function helperWorkers(source, log, options = {}) {
         Blob, Response, DecompressionStream, Uint8Array, ArrayBuffer, setTimeout, Promise, Error, String,
         fetch: () => { throw new Error('a helper never fetches'); },
         self: { location: { href: 'blob:reader' } },
+        caches: options.caches, navigator: options.navigator,
         postMessage(message) { setTimeout(() => self.onmessage && self.onmessage({ data: message }), 0); },
       };
       if (options.breakDecode) context.DecompressionStream = class { constructor() { throw new Error('broken'); } };
@@ -109,13 +110,17 @@ function helperWorkers(source, log, options = {}) {
 }
 
 function deferredReaderWorker(provider, options = {}) {
-  // Cook the actual template, as the page and recomp-web.test.js do.
-  const source = new Function('return `' + /const READER_WORKER = `([\s\S]*?)\r?\n`;/.exec(bootWeb)[1] + '`')();
+  // Cook the actual template, as the page and recomp-web.test.js do, and append the
+  // page's recipe decoder, as startReader appends String(isaacRecipeDecode).
+  const recipeJs = readFileSync(join(root, 'scripts', 'recomp', 'web', 'recipe.js'), 'utf8');
+  const source = new Function('return `' + /const READER_WORKER = `([\s\S]*?)\r?\n`;/.exec(bootWeb)[1] + '`')()
+    + '\n' + recipeJs.slice(recipeJs.indexOf('function isaacRecipeDecode')) + '\n';
   const network = deferredFetch(), replies = new Map(), helperLog = { started: 0, sent: [] };
   let nextWant = 1;
   const worker = {
     fetch: network.fetch, Blob, Response, DecompressionStream, Uint8Array, ArrayBuffer, setTimeout,
     self: { location: { href: 'blob:reader' } },
+    caches: options.caches, navigator: options.navigator,
     Worker: helperWorkers(source, helperLog, options),
     postMessage(message) {
       if (message.download) {
@@ -1000,6 +1005,101 @@ test('portable reader starts the next download while a window is still decoding'
   for (let i = 0; i < 50 && network.requests.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
   assert.equal(network.requests.length, 2, 'and the second download started meanwhile');
   for (const go of network.helperLog.held.splice(0)) go();
+});
+
+// Round 96e: the decoded-window cache. A fake Cache Storage, shared by the reader, its
+// helpers and a second visit's reader; the quota is the fake navigator's.
+function fakeCaches() {
+  const store = new Map();
+  return {
+    store,
+    async open(name) {
+      if (!store.has(name)) store.set(name, new Map());
+      const m = store.get(name);
+      return {
+        async put(key, res) { m.set(String(key), new Uint8Array(await res.arrayBuffer())); },
+        async match(key) { return m.has(String(key)) ? new Response(m.get(String(key)).slice()) : undefined; },
+        async delete(key) { return m.delete(String(key)); },
+        async keys() { return [...m.keys()].map((url) => ({ url })); },
+      };
+    },
+    async keys() { return [...store.keys()]; },
+    async delete(name) { return store.delete(name); },
+  };
+}
+const roomy = { storage: { estimate: async () => ({ quota: 8e9, usage: 1e8 }) } };
+function rawRecipe(version, bytes) {
+  // "RW" version | u32 outLen | u16 segments | (version 2: u8 heads = 0) | one raw segment
+  const head = Buffer.alloc(version === 2 ? 10 : 9);
+  head.write('RW', 0); head[2] = version; head.writeUInt32LE(bytes.length, 3); head.writeUInt16LE(1, 7);
+  const seg = Buffer.alloc(5); seg[0] = 0; seg.writeUInt32LE(bytes.length, 1);
+  return Buffer.concat([head, seg, bytes]);
+}
+async function cacheVisit(caches, options = {}) {
+  const data = chunkData(0, 1);
+  const v2 = Buffer.allocUnsafe(WIN), v1 = Buffer.allocUnsafe(WIN);
+  for (let i = 0; i < WIN; i++) { v2[i] = (i * 7 + (i >>> 9)) & 255; v1[i] = (i * 11 + (i >>> 7)) & 255; }
+  const z2 = gzipSync(rawRecipe(2, v2)), z1 = gzipSync(rawRecipe(1, v1)), chunk = Buffer.concat([z2, z1]);
+  Object.assign(data.streams[1], { base: 'https://archives.test/cache/c', win: WIN, wl: [z2.length, z1.length], wz: '22', stored: [chunk.length] });
+  const h = deferredPortable(data);
+  await answerProbes(h, [chunk]);
+  assert.equal(await h.provider.ready, true);
+  const network = deferredReaderWorker(h.provider, { caches, navigator: options.navigator || roomy, helpers: options.helpers || 0 });
+  network.post({ decodedCache: { name: options.name || 'isaac-win-release', prefix: 'isaac-win-' } });
+  for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+  const rel = 'resources/packed/archive.a';
+  const read = async (off, len) => {
+    const before = network.requests.length, received = h.provider.progress().received;
+    const p = network.read(h.provider.urlFor(rel, off, len), len);
+    for (let i = 0; i < 20 && network.requests.length === before; i++) await new Promise((r) => setTimeout(r, 0));
+    const fetched = network.requests.length > before;
+    if (fetched) answerRange(network.requests[network.requests.length - 1], chunk);
+    const m = await p;
+    for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0));
+    return { fetched, bytes: Buffer.from(m.buf), counted: h.provider.progress().received - received };
+  };
+  return { read, v2, v1, h };
+}
+
+test('portable reader keeps decoded version 2 windows and the next visit reads them without a download', { timeout: 5000 }, async () => {
+  const caches = fakeCaches();
+  caches.store.set('isaac-win-older', new Map([['https://old.test/b0.bin', new Uint8Array(4)]]));
+  const first = await cacheVisit(caches, { helpers: 1 });
+  assert.ok(!caches.store.has('isaac-win-older'), "another release's cache is deleted");
+  let r = await first.read(100, 2048);
+  assert.ok(r.fetched); assert.deepEqual(r.bytes, first.v2.subarray(100, 2148));
+  const counted = r.counted;
+  assert.ok(counted > 0, 'a fetched window counts its stored bytes');
+  r = await first.read(WIN + 300, 1024);
+  assert.ok(r.fetched); assert.deepEqual(r.bytes, first.v1.subarray(300, 1324));
+  const kept = caches.store.get('isaac-win-release');
+  assert.equal(kept.size, 1, 'the version 2 window only');
+  assert.deepEqual(Buffer.from([...kept.values()][0]), first.v2, 'the whole decoded window, not the cut');
+  const second = await cacheVisit(caches);
+  r = await second.read(5000, 4096);
+  assert.equal(r.fetched, false, 'no download for a kept window');
+  assert.deepEqual(r.bytes, second.v2.subarray(5000, 9096));
+  assert.equal(r.counted, counted, 'and the loading bar counts it as the download it stands for');
+  r = await second.read(WIN + 300, 1024);
+  assert.equal(r.fetched, true, 'a version 1 window is fetched as before');
+});
+
+test('portable reader keeps nothing without spare quota, and a short kept window is a miss', { timeout: 5000 }, async () => {
+  const tight = { storage: { estimate: async () => ({ quota: 2e9, usage: 1.5e9 }) } };
+  const caches = fakeCaches();
+  const visit = await cacheVisit(caches, { navigator: tight });
+  assert.equal((await visit.read(100, 2048)).fetched, true);
+  assert.equal(caches.store.has('isaac-win-release') ? caches.store.get('isaac-win-release').size : 0, 0, 'nothing kept');
+  const roomyCaches = fakeCaches();
+  const a = await cacheVisit(roomyCaches);
+  await a.read(0, 1024);
+  const m = roomyCaches.store.get('isaac-win-release');
+  const [k] = [...m.keys()];
+  m.set(k, m.get(k).subarray(0, 512));
+  const b = await cacheVisit(roomyCaches);
+  const r = await b.read(0, 1024);
+  assert.equal(r.fetched, true, 'shorter than the cut: fetched again');
+  assert.deepEqual(r.bytes, b.v2.subarray(0, 1024));
 });
 
 test('portable reader with no helpers decodes as before, and a failing helper fails its read', { timeout: 5000 }, async () => {

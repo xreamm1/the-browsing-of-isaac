@@ -316,8 +316,43 @@ function unscramble(buf, pos) {
   for (let i = 0; i < b.length; i++) { const at = pos + i; b[i] ^= xorKey[at & 255] ^ ((at >> 8) & 255); }
   return b.buffer;
 }
-// A fetched window, unscrambled, inflated, rebuilt from its recipe and cut.
-function decodeHere(buf, at, packed, from, take) {
+// Round 96e: a decoded Vorbis window (recipe version 2) is kept in Cache Storage, and
+// the next visit reads it back instead of fetching and decoding it again -- the
+// decode is what a returning player, whose stream B is in the HTTP cache, still paid.
+// The page turns it on ({ decodedCache: { name, prefix } }, the name carrying the
+// release's stream B) when the origin has a gigabyte of quota to spare; caches of
+// other releases are deleted then. The key is the window's own URL without its
+// fragment: chunk, version and window are in it. A hit shorter than the cut is dropped.
+// 0: off (no request from the page), 1: deciding (the quota is being read), 2: on
+let decodedCache = null, decodedReady = Promise.resolve(false), decodedState = 0;
+function keepDecoded(key, w) {
+  if (!decodedCache || !key) return;
+  caches.open(decodedCache.name).then((c) => c.put(key, new Response(w))).catch(() => {});
+}
+function decodedHit(key, need) {
+  if (!key) return Promise.resolve(null);
+  return decodedReady.then((on) => !on ? null : caches.open(decodedCache.name).then((c) =>
+    c.match(key).then((r) => (r ? r.arrayBuffer() : null)).then((b) => {
+      if (!b) return null;
+      if (b.byteLength >= need) return b;
+      c.delete(key).catch(() => {});
+      return null;
+    }))).catch(() => null);
+}
+function useDecodedCache(cfg) {
+  decodedState = 1;
+  decodedReady = ((typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate) ? navigator.storage.estimate() : Promise.resolve(null))
+    .then((est) => {
+      if (!est || !(est.quota - est.usage >= 1073741824)) { decodedState = 0; return false; }
+      decodedCache = cfg; decodedState = 2;
+      for (const h of helpers) h.postMessage({ decodedCache: cfg, helper: true });
+      return caches.keys().then((names) => Promise.all(names.filter((n) => n.indexOf(cfg.prefix) === 0 && n !== cfg.name)
+        .map((n) => caches.delete(n)))).then(() => true);
+    }).catch(() => { decodedState = 0; decodedCache = null; return false; });
+}
+// A fetched window, unscrambled, inflated, rebuilt from its recipe and cut; with a
+// key in store, a decoded version 2 recipe window is kept for the next visit.
+function decodeHere(buf, at, packed, from, take, store) {
   // unscramble hands back an ArrayBuffer, and ArrayBuffer.slice returns
   // another ArrayBuffer -- which has no .buffer. An uncompressed window
   // (Vorbis, Theora) skips the inflate below, so it reached the cut still
@@ -332,7 +367,10 @@ function decodeHere(buf, at, packed, from, take) {
     // version-0 archive's own bytes by isaacRecipeDecode (recipe.js, appended
     // to this Worker's source by the page). Round 96d: a recipe with Vorbis in it
     // answers with a Promise (the browser's decoder is asynchronous).
-    return Promise.resolve(packed === 2 ? isaacRecipeDecode(out) : out).then((w) => w.slice(from, from + take).buffer);
+    return Promise.resolve(packed === 2 ? isaacRecipeDecode(out) : out).then((w) => {
+      if (store && packed === 2 && out[2] === 2) keepDecoded(store, w);
+      return w.slice(from, from + take).buffer;
+    });
   });
 }
 // Round 96: the boot's sound preload waited on this Worker decoding recipes --
@@ -353,12 +391,12 @@ function retireIdle() {
     if (!busy) { helpers.splice(i, 1); try { h.terminate(); } catch (e) { /* gone */ } }
   }
 }
-function decodeWin(buf, at, packed, from, take) {
-  if (!packed || !helpers.length || retiring) return decodeHere(buf, at, packed, from, take);
+function decodeWin(buf, at, packed, from, take, store) {
+  if (!packed || !helpers.length || retiring) return decodeHere(buf, at, packed, from, take, store);
   const h = helpers[hnext++ % helpers.length], id = ++hseq;
   return new Promise((resolve, reject) => {
     hwait.set(id, { h, resolve, reject });
-    h.postMessage({ decode: id, buf, at, packed, from, take }, [buf]);
+    h.postMessage({ decode: id, buf, at, packed, from, take, store }, [buf]);
   });
 }
 function addHelpers(n) {
@@ -366,6 +404,7 @@ function addHelpers(n) {
     let h;
     try { h = new Worker(self.location.href); } catch (e) { return; }
     if (xorKey) h.postMessage({ xorKey });
+    if (decodedCache) h.postMessage({ decodedCache, helper: true });
     h.onmessage = (e) => {
       const r = hwait.get(e.data.decoded);
       if (!r) return;
@@ -480,13 +519,21 @@ function start(key, url, len, why, want) {
     if (r.status === 200) postMessage({ download: { url, from: 0, to: buf.byteLength } });
     return buf;
   };
-  tries().then(async (buf) => {
+  // round 96e: a recipe window may be in the decoded cache from an earlier visit
+  const store = winAt >= 0 && winPacked === 2 ? url : null;
+  // (with the cache off the fetch starts at once, as before)
+  const got = store && decodedState ? () => decodedHit(store, winFrom + winTake).then((hit) => (hit ? { hit } : tries())) : tries;
+  got().then(async (buf) => {
     landed();
-    if (buf && winAt >= 0) {
+    if (buf && buf.hit) {
+      // counted as the download it stands for, so the loading bar reads the same
+      postMessage({ download: { url, from: want0, to: want1 + 1 } });
+      buf = buf.hit.slice(winFrom, winFrom + winTake);
+    } else if (buf && winAt >= 0) {
       // a host that ignored the Range sent the whole chunk: the window's own
       // bytes still start where the fragment said
       if (buf.byteLength > want1 - want0 + 1) buf = buf.slice(want0, want1 + 1);
-      buf = await decodeWin(buf, winAt, winPacked, winFrom, winTake);
+      buf = await decodeWin(buf, winAt, winPacked, winFrom, winTake, store);
     }
     // a host that ignored the Range sent the whole chunk: put it back from the
     // chunk's own start, then cut out the window
@@ -510,8 +557,13 @@ function pump() {
 onmessage = (e) => {
   const d = e.data;
   if (d.xorKey) { xorKey = new Uint8Array(d.xorKey); for (const h of helpers) h.postMessage({ xorKey }); return; }
+  if (d.decodedCache) {
+    if (d.helper) { decodedCache = d.decodedCache; decodedState = 2; decodedReady = Promise.resolve(true); }
+    else useDecodedCache(d.decodedCache);
+    return;
+  }
   if (d.decode) {
-    Promise.resolve().then(() => decodeHere(d.buf, d.at, d.packed, d.from, d.take)).then(
+    Promise.resolve().then(() => decodeHere(d.buf, d.at, d.packed, d.from, d.take, d.store)).then(
       (buf) => postMessage({ decoded: d.decode, buf }, [buf]),
       (e) => postMessage({ decoded: d.decode, err: String((e && e.message) || e) }));
     return;
@@ -573,6 +625,11 @@ function startReader() {
   // round 77: a chunked build's payload is scrambled, and a window is a range the
   // Worker fetches, so the Worker is where it has to be put back
   if (hooks.chunkKey) w.postMessage({ xorKey: hooks.chunkKey });
+  // round 96e: decoded Vorbis windows kept for the next visit, in a cache named
+  // after the release's stream B (a portable build's base); ?wincache=0 keeps none
+  const pdata = window.__isaacPortableData;
+  if (pdata && pdata.base && params.get('wincache') !== '0' && typeof caches !== 'undefined')
+    w.postMessage({ decodedCache: { name: 'isaac-win-' + pdata.base, prefix: 'isaac-win-' } });
   // round 96: helpers decode the packed windows beside the reader (its source
   // above); ?decoders=0 keeps every decode on the reader, as rounds 56-95 did
   const asked = params.get('decoders'), cores = Number(navigator.hardwareConcurrency) || 2;
