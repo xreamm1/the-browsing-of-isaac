@@ -70,6 +70,10 @@ typedef struct {
     uint32_t win_off[FS_WIN_SLOTS], win_len[FS_WIN_SLOTS], win_tick[FS_WIN_SLOTS];
     uint8_t  win_last;        /* the slot used last */
     uint8_t  used;
+    /* round 99: the archive's WAV header overlay (<key>.ovl, wav_overlay.py):
+     * its entry, block count, the blob's size when attached, each block's data offset */
+    uint32_t ovl_slot, ovl_n, ovl_size;
+    uint32_t *ovl_at;
 } fs_wincache;
 #define FS_WIN_FILES 64u
 static fs_wincache g_wc[FS_WIN_FILES];
@@ -375,9 +379,95 @@ static int fs_pread(const char *src, uint8_t *dst, uint32_t off, uint32_t len) {
  * reads for 1.5 GB of archives); a level load walks a few dozen MB of
  * scattered resources (two windows thrashed: 827 MB for one run start). The
  * slots are an LRU set; the window used last is tried first. */
+/* ---- round 99: WAV header overlays ------------------------------------------
+ * With round 98's lazy samples the game parses each WAV's header at boot and
+ * reads its PCM when it is first played. The header parse reads the archive
+ * entry's first 1 KB blocks, and each of those made the page fetch and decode
+ * the whole 1 MiB window around it: 150 of the boot's 182 windows of the two
+ * sound archives were touched for headers alone. <archive>.ovl
+ * (wav_overlay.py) holds exactly those blocks, raw; a read lying inside one is
+ * answered from it -- while lazy samples are on and no fill is running, so
+ * the PCM a sound plays still comes through the windows. */
+static uint32_t g_ovl_hits, g_ovl_attached;
+static uint64_t g_ovl_bytes;
+int isaac_fs_overlay_allowed(void) {
+    return isaac_snd_lazy_enabled() && !isaac_snd_fill_target();
+}
+void isaac_fs_overlay_stats(uint32_t *attached, uint32_t *hits, uint64_t *bytes) {
+    if (attached) *attached = g_ovl_attached;
+    if (hits) *hits = g_ovl_hits;
+    if (bytes) *bytes = g_ovl_bytes;
+}
+static uint32_t fs_u32le(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static fs_entry *fs_overlay_entry(const fs_wincache *w) {
+    if (!w->ovl_slot) return NULL;
+    fs_entry *o = &g_fs[w->ovl_slot - 1u];
+    return (o->live && o->data && o->size == w->ovl_size) ? o : NULL;   /* replaced or deleted: gone */
+}
+/* An overlay blob's block table, checked against the archive's size: each
+ * block's data offset in the blob into offs (n entries), its bytes into *data.
+ * 0 if the blob is not a well-formed overlay for an archive of `archive` bytes. */
+static int fs_overlay_parse(const uint8_t *b, uint32_t sz, uint32_t archive, uint32_t *n_out, uint32_t **offs_out, uint32_t *data) {
+    if (!b || sz < 12u || memcmp(b, "IOVL", 4) || fs_u32le(b + 4) != 1u) return 0;
+    uint32_t n = fs_u32le(b + 8);
+    if (n > (sz - 12u) / 8u) return 0;
+    uint32_t at = 12u + 8u * n, prev_end = 0;
+    uint32_t *offs = (uint32_t *)malloc((size_t)(n ? n : 1u) * sizeof *offs);
+    if (!offs) return 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t off = fs_u32le(b + 12u + 8u * i), len = fs_u32le(b + 16u + 8u * i);
+        if (!len || off < prev_end || off > archive || len > archive - off || len > sz - at) { free(offs); return 0; }
+        offs[i] = at;
+        at += len;
+        prev_end = off + len;
+    }
+    *n_out = n; *offs_out = offs; *data = at - 12u - 8u * n;
+    return 1;
+}
+/* look for <key>.ovl beside a windowed entry (seeded whole); 1 if one is attached */
+static int fs_overlay_attach(fs_entry *e, fs_wincache *w) {
+    char k2[300];
+    if (snprintf(k2, sizeof k2, "%s.ovl", e->key) >= (int)sizeof k2) return 0;
+    fs_entry *o = fs_find(k2);
+    if (!o || o->is_dir || o->lazy) return 0;
+    uint32_t n = 0, bytes = 0, *offs = NULL;
+    if (!fs_overlay_parse(o->data, o->size, e->size, &n, &offs, &bytes)) {
+        isaac_log("[isaac][fs] %s is not a well-formed header overlay; '%s' is read through its windows only", k2, e->key);
+        return 0;
+    }
+    w->ovl_slot = (uint32_t)(o - g_fs) + 1u; w->ovl_n = n; w->ovl_size = o->size; w->ovl_at = offs;
+    ++g_ovl_attached;
+    isaac_log("[isaac][fs] '%s': %u WAV header blocks (%u KB) answered without a window (%s)", e->key, n, bytes >> 10, k2);
+    return 1;
+}
+/* [p, p + n) inside one overlay block: copied, n returned; else 0 */
+static uint32_t fs_overlay_read(fs_wincache *w, uint64_t p, uint32_t n, uint8_t *dst) {
+    if (!w->ovl_n || !n || p > 0xFFFFFFFFull || !isaac_fs_overlay_allowed()) return 0;
+    fs_entry *o = fs_overlay_entry(w);
+    if (!o) return 0;
+    const uint8_t *b = o->data;
+    uint32_t lo = 0, hi = w->ovl_n;                     /* the last block starting at or before p */
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (fs_u32le(b + 12u + 8u * mid) <= (uint32_t)p) lo = mid + 1u; else hi = mid;
+    }
+    if (!lo) return 0;
+    uint32_t i = lo - 1u, off = fs_u32le(b + 12u + 8u * i), len = fs_u32le(b + 16u + 8u * i);
+    if ((uint64_t)p + n > (uint64_t)off + len) return 0;
+    memcpy(dst, b + w->ovl_at[i] + ((uint32_t)p - off), n);
+    ++g_ovl_hits; g_ovl_bytes += n;
+    return n;
+}
+
 static uint32_t fs_window_read(fs_entry *e, uint64_t pos, uint32_t want, uint8_t *dst) {
     uint32_t done = 0;
     if (!e->wc) return 0;
+    {   /* ISAAC_FS_READS=1: every read of a windowed file, and whether a sound fill made it */
+        static int on = -1;
+        if (on < 0) { const char *v = getenv("ISAAC_FS_READS"); on = (v && *v == '1') ? 1 : 0; }
+        if (on) isaac_log("[isaac][fs] read %s %llu %u%s", e->src ? e->src : e->key, (unsigned long long)pos, want,
+                          isaac_snd_fill_target() ? " fill" : "");
+    }
     fs_wincache *w = &g_wc[e->wc - 1u];
     while (done < want) {
         uint64_t p = pos + done;
@@ -388,6 +478,8 @@ static uint32_t fs_window_read(fs_entry *e, uint64_t pos, uint32_t want, uint8_t
         else for (k = 0; k < FS_WIN_SLOTS; ++k)
             if (w->win[k] && p >= w->win_off[k] && p < (uint64_t)w->win_off[k] + w->win_len[k]) { hit = k; break; }
         if (hit == FS_WIN_SLOTS) {
+            uint32_t got = fs_overlay_read(w, p, want - done, dst + done);
+            if (got) { done += got; continue; }               /* round 99: a WAV header block, no window */
             uint64_t start = p & ~(uint64_t)(FS_WIN - 1u);
             uint32_t len = (uint32_t)((e->size - start) < FS_WIN ? (e->size - start) : FS_WIN);
             int n;
@@ -427,6 +519,7 @@ static void fs_window_drop(fs_entry *e) {
     if (e->wc) {
         fs_wincache *w = &g_wc[e->wc - 1u];
         for (unsigned k = 0; k < FS_WIN_SLOTS; ++k) if (w->win[k]) free(w->win[k]);
+        free(w->ovl_at);
         memset(w, 0, sizeof *w);              /* and free for the next windowed entry */
         e->wc = 0;
     }
@@ -466,6 +559,7 @@ static int fs_materialise(fs_entry *e) {
         ++g_lazy_windowed;
         isaac_log("[isaac][fs] '%s' (%u bytes) is served through a %u KB window, never loaded whole",
                   e->src ? e->src : e->key, e->size, FS_WIN >> 10);
+        fs_overlay_attach(e, &g_wc[wc]);
         return 1;
     }
     e->lazy = 0;

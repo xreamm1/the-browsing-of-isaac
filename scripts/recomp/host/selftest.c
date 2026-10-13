@@ -425,11 +425,14 @@ static void test_lazy_textures(void) {
  * The guest call that fills is replaced: the table, the fill's choice of buffers,
  * the loader's fill mode and the forgetting on free are what is driven here. */
 static uint32_t g_sf_calls, g_sf_ptr, g_sf_size, g_sf_ok = 1, g_sf_begin, g_sf_target, g_sf_self, g_sf_path;
+static int g_sf_overlay = -1;
 static char g_sf_name[64];
+extern int isaac_fs_overlay_allowed(void);
 static int fake_sound_fill(CpuState *cpu, uint32_t ptr, uint32_t size, const char *path) {
     (void)cpu;
     ++g_sf_calls; g_sf_ptr = ptr; g_sf_size = size;
     strncpy(g_sf_name, path, sizeof g_sf_name - 1);
+    g_sf_overlay = isaac_fs_overlay_allowed();                   /* round 99: a fill reads through the windows */
     g_sf_target = isaac_snd_fill_target();                       /* what the loader's patches see */
     g_sf_begin = isaac_snd_lazy_begin(g_sf_self, g_sf_path, size);
     if (g_sf_ok) memset(isaac_g(ptr), 0x5A, size);
@@ -471,6 +474,8 @@ static void test_lazy_sound(void) {
           "lazy sound: its first upload fills it once, through the loader, from its path");
     check(g_sf_target == b1 && g_sf_begin == 0u && isaac_snd_fill_target() == 0u && isaac_snd_lazy_pending() == 2u,
           "lazy sound: in the fill the loader allocates the recorded buffer and reads the PCM; after it, no fill");
+    check(g_sf_overlay == 0 && isaac_fs_overlay_allowed() == 1,
+          "lazy sound: a fill reads the archive through its windows, never a header overlay (round 99); outside one the overlay may answer");
     isaac_snd_lazy_fill(&c, b1, 0x800u);
     check(g_sf_calls == 1u, "lazy sound: later uploads find it filled");
     isaac_snd_lazy_fill(&c, b2 + 0x10u, 0x20u);
@@ -3902,6 +3907,95 @@ int main(int argc, char **argv) {
 #endif
                 }
                 memcpy(isaac_g(mbuf), "rb", 3u);
+                /* Round 99: a WAV header overlay (<archive>.ovl) beside a windowed file.
+                 * Its blocks hold bytes no window has (ovl_byte), so where each byte came
+                 * from is visible: a read inside a block costs no host read, any other
+                 * read goes through the windows, and with lazy samples off (or in a fill,
+                 * test_lazy_sound) the overlay is not used at all. */
+                {
+                    extern void isaac_fs_overlay_stats(uint32_t *attached, uint32_t *hits, uint64_t *bytes);
+                    extern int isaac_fs_overlay_allowed(void);
+                    #define OVL_BYTE(o) ((uint8_t)((o) * 13u + 5u))
+                    static uint8_t ov[28 + 1024 + 1000];
+                    static const uint32_t head[7] = { 0x4c564f49u /* "IOVL" */, 1u, 2u, 2048u, 1024u, 1500000u, 1000u };
+                    for (int i = 0; i < 7; ++i) { uint32_t v = head[i]; ov[i * 4] = (uint8_t)v; ov[i * 4 + 1] = (uint8_t)(v >> 8); ov[i * 4 + 2] = (uint8_t)(v >> 16); ov[i * 4 + 3] = (uint8_t)(v >> 24); }
+                    for (uint32_t i = 0; i < 1024u; ++i) ov[28 + i] = OVL_BYTE(2048u + i);
+                    for (uint32_t i = 0; i < 1000u; ++i) ov[28 + 1024 + i] = OVL_BYTE(1500000u + i);
+                    isaac_snd_lazy_set_mode(1);
+                    check(isaac_fs_seed("data/Ovl.bin.ovl", ov, sizeof ov) == 1 && isaac_fs_seed_lazy("data/Ovl.bin", WIN_FILE_SIZE) == 1,
+                          "overlay: a windowed file and its header overlay are seeded");
+                    const char *op = "data/Ovl.bin";
+                    for (unsigned i = 0; ; ++i) { *(uint8_t *)isaac_g(pbuf + i) = (uint8_t)op[i]; if (!op[i]) break; }
+                    memset(&cpu, 0, sizeof cpu); cpu.ESP = ISAAC_STACK_TOP_VA - 0x1000;
+                    isaac_w32(cpu.ESP, 0xDEADBEEF); isaac_w32(cpu.ESP + 4, pbuf); isaac_w32(cpu.ESP + 8, mbuf);
+                    imp_api_ms_win_crt_stdio__fopen(&cpu);
+                    uint32_t oh = cpu.EAX;
+                    uint32_t att0 = 0, hits0 = 0; uint64_t by0 = 0;
+                    isaac_fs_overlay_stats(&att0, &hits0, &by0);
+                    /* read [off, off + len) and say whether every byte is the overlay's (1), the window's (2), or neither (0) */
+                    #define OVL_READ(off, len, out) do { \
+                        memset(&cpu, 0, sizeof cpu); cpu.ESP = ISAAC_STACK_TOP_VA - 0x1000; \
+                        isaac_w32(cpu.ESP, 0xDEADBEEF); isaac_w32(cpu.ESP + 4, oh); isaac_w32(cpu.ESP + 8, (off)); isaac_w32(cpu.ESP + 12, 0); \
+                        imp_api_ms_win_crt_stdio__fseek(&cpu); \
+                        memset(&cpu, 0, sizeof cpu); cpu.ESP = ISAAC_STACK_TOP_VA - 0x1000; \
+                        isaac_w32(cpu.ESP, 0xDEADBEEF); isaac_w32(cpu.ESP + 4, big); isaac_w32(cpu.ESP + 8, 1); \
+                        isaac_w32(cpu.ESP + 12, (len)); isaac_w32(cpu.ESP + 16, oh); \
+                        imp_api_ms_win_crt_stdio__fread(&cpu); \
+                        int ov_ = cpu.EAX == (len), wn_ = cpu.EAX == (len); \
+                        for (uint32_t i_ = 0; i_ < (len); ++i_) { uint8_t b_ = *(uint8_t *)isaac_g(big + i_); \
+                            if (b_ != OVL_BYTE((off) + i_)) ov_ = 0; if (b_ != win_byte((off) + i_)) wn_ = 0; } \
+                        (out) = ov_ ? 1 : wn_ ? 2 : 0; } while (0)
+                    int src1, src2, src3, src4, src5;
+                    uint32_t p0 = g_pread_calls;
+                    OVL_READ(2048u, 1024u, src1);
+                    OVL_READ(2100u, 100u, src2);
+                    check(oh && src1 == 1 && src2 == 1 && g_pread_calls == p0,
+                          "overlay: a block, and a read inside it, come from the overlay with no host read");
+                    OVL_READ(3000u, 100u, src3);
+                    check(src3 == 2 && g_pread_calls == p0 + 1u, "overlay: a read crossing a block's end goes through a window");
+                    OVL_READ(1500500u, 500u, src4);
+                    uint32_t att1 = 0, hits1 = 0; uint64_t by1 = 0;
+                    isaac_fs_overlay_stats(&att1, &hits1, &by1);
+                    check(src4 == 1 && att1 == att0 + 1u && hits1 == hits0 + 3u && by1 == by0 + 1624u,
+                          "overlay: the second block too; one overlay attached, three reads (1,624 bytes) answered by it");
+                    isaac_snd_lazy_set_mode(0);
+                    OVL_READ(1500000u, 100u, src5);
+                    check(!isaac_fs_overlay_allowed() && src5 == 2, "overlay: with lazy samples off it is not used (the window's bytes)");
+                    isaac_snd_lazy_set_mode(1);
+                    memset(&cpu, 0, sizeof cpu); cpu.ESP = ISAAC_STACK_TOP_VA - 0x1000;
+                    isaac_w32(cpu.ESP, 0xDEADBEEF); isaac_w32(cpu.ESP + 4, oh);
+                    imp_api_ms_win_crt_stdio__fclose(&cpu);
+                    /* malformed overlays are refused: a wrong magic, and blocks out of order */
+                    static uint8_t bad1[28 + 8], bad2[28 + 8];
+                    static const uint32_t head1[7] = { 0x4c564f58u /* "XOVL" */, 1u, 2u, 2048u, 4u, 4096u, 4u };   /* in order, wrong magic */
+                    static const uint32_t head2[7] = { 0x4c564f49u, 1u, 2u, 4096u, 4u, 2048u, 4u };                /* right magic, out of order */
+                    for (int i = 0; i < 7; ++i) {
+                        uint32_t v = head1[i], u = head2[i];
+                        bad1[i * 4] = (uint8_t)v; bad1[i * 4 + 1] = (uint8_t)(v >> 8); bad1[i * 4 + 2] = (uint8_t)(v >> 16); bad1[i * 4 + 3] = (uint8_t)(v >> 24);
+                        bad2[i * 4] = (uint8_t)u; bad2[i * 4 + 1] = (uint8_t)(u >> 8); bad2[i * 4 + 2] = (uint8_t)(u >> 16); bad2[i * 4 + 3] = (uint8_t)(u >> 24);
+                    }
+                    static const struct { const char *path; const uint8_t *blob; } bads[2] = { { "data/BadA.bin", bad1 }, { "data/BadB.bin", bad2 } };
+                    for (int k = 0; k < 2; ++k) {
+                        char ovp[64]; snprintf(ovp, sizeof ovp, "%s.ovl", bads[k].path);
+                        isaac_fs_seed(ovp, bads[k].blob, 28 + 8);
+                        isaac_fs_seed_lazy(bads[k].path, WIN_FILE_SIZE);
+                        for (unsigned i = 0; ; ++i) { *(uint8_t *)isaac_g(pbuf + i) = (uint8_t)bads[k].path[i]; if (!bads[k].path[i]) break; }
+                        memset(&cpu, 0, sizeof cpu); cpu.ESP = ISAAC_STACK_TOP_VA - 0x1000;
+                        isaac_w32(cpu.ESP, 0xDEADBEEF); isaac_w32(cpu.ESP + 4, pbuf); isaac_w32(cpu.ESP + 8, mbuf);
+                        imp_api_ms_win_crt_stdio__fopen(&cpu);
+                        oh = cpu.EAX;
+                        int srcb;
+                        OVL_READ(2048u, 4u, srcb);
+                        uint32_t attb = 0; isaac_fs_overlay_stats(&attb, NULL, NULL);
+                        check(oh && srcb == 2 && attb == att1, k ? "overlay: one with its blocks out of order is refused (window bytes)"
+                                                                 : "overlay: one with a wrong magic is refused (window bytes)");
+                        memset(&cpu, 0, sizeof cpu); cpu.ESP = ISAAC_STACK_TOP_VA - 0x1000;
+                        isaac_w32(cpu.ESP, 0xDEADBEEF); isaac_w32(cpu.ESP + 4, oh);
+                        imp_api_ms_win_crt_stdio__fclose(&cpu);
+                    }
+                    #undef OVL_READ
+                    #undef OVL_BYTE
+                }
                 isaac_fs_set_lazy_preader(NULL);
                 isaac_fs_set_window_min(0u);
             }

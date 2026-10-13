@@ -1151,7 +1151,9 @@ try {
   const index = JSON.parse(new TextDecoder().decode(await fetchBytes('/instance_index.json')));
   await stageOk('seed packed archives', async () => {
     let n = 0;
-    for (const name of ['graphics.a', 'config.a', 'fonts.a', 'animations.a', 'rooms.a', 'sfx.a']) {
+    // round 99: the two windowed sound archives' WAV header overlays (wav_overlay.py): the
+    // boot parses every sample's header, and these answer it without a window
+    for (const name of ['graphics.a', 'config.a', 'fonts.a', 'animations.a', 'rooms.a', 'sfx.a', 'afterbirthp.a.ovl', 'afterbirth.a.ovl']) {
       const rel = `resources/packed/${name}`;
       let bytes;
       try { bytes = await fetchBytes(`/instance/${rel}`); } catch { log(`  (skip ${name}: not served)`); continue; }
