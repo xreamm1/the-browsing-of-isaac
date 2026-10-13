@@ -9438,3 +9438,98 @@ round 69 sized the arena for is no longer the figure.
 12 mutants were killed. One survives: zeroing a band after a corrupt kept
 code. The API cannot corrupt a kept code, so it is a defence only (round 97
 uploaded whatever the scratch held).
+
+### 21.129 Round 98: a sound's samples are read when it is first played
+
+**What the arena held.** `window.isaacHeapReport()` gives 236 MiB live in the
+guest arena after boot. The archives hold 1,724 WAVs, 199 MiB of them, and
+the game preloads its sound catalogue: 1,538 samples, **161.2 MB of PCM**.
+Each sits in the guest heap from boot to the end of the session.
+
+**The path, from the instruction stream** (pequery, decode config
+`linear+skipdata+jtab-mask v2 (+fld)`):
+
+- **The loader.** `0x00a7b6a0` is slot +0x1c of vtable `0xba2974`, whose RTTI
+  is `KAGE::Sound::SampleSourceWav` (thiscall, `ret 4`, the path its
+  argument). It runs these steps:
+  - opens a stream for the path: archive lookup `0x00a17f40`, else a loose
+    file (vtable `0xb9e940`);
+  - pass 1: parser `0x00a9f630` reads the header only and sizes the data
+    chunk into `[ebp-0x30]`;
+  - rewinds the stream;
+  - allocates that size from the game heap (`0x00a230b0`, stdcall `ret 8`,
+    malloc underneath) into `[this+0x50]`;
+  - pass 2 (`0x00a7b7f6`, its flag pushed at `0x00a7b7f0`) reads fmt and the
+    PCM;
+  - deletes the stream (`0x00a7b7fe`).
+- **The parser.** It stores fmt and the data size in either mode. Header-only
+  skips only the read and stops at the data chunk. All 1,724 shipped WAVs
+  have their fmt before their data and none after it (`cue`, `LIST`, `acid`
+  and the like follow, and are only skipped).
+- **The bytes' one use.** `alBufferData` at `0x00a9fcb4` (in `0x00a9fb80`),
+  on every play: `[esi+0x28]` and `[esi+0x2c]` are the pointer and length.
+  A census of the pointer field across 152 functions found nothing else that
+  reads or writes the samples. `0x00a9f980` frees them with the last
+  reference (`0x00a23160`). Several sound objects can share one buffer.
+- **Allocations.** `VirtualAlloc` (which this host zeroes) has 4 callers, all
+  in the Lua arena's reservations. The game heap allocates with `malloc`,
+  which writes only a block's header and footer. An unwritten sample buffer
+  therefore stays an untouched run of pages.
+
+**What changed.**
+
+- `host_snd_lazy.c` keeps a table of recorded buffers (pointer, size, path),
+  sorted by pointer.
+- Three block patches in the loader:
+  - `0x00a7b7f0`: pass 2's flag comes from `isaac_snd_lazy_begin`. That
+    records the buffer and answers header-only, or answers the full read
+    when lazy samples are off, during a fill, or when the buffer was not
+    recorded.
+  - `0x00a7b7dc`: in a fill, the allocation is the recorded buffer, and the
+    call's two arguments are popped as `ret 8` would have.
+  - `0x00a7b806`: a fill returns once pass 2 has read and the stream is
+    deleted.
+- **The fill.** The `alBufferData` shim fills every recorded buffer that
+  overlaps the upload. It calls the game's own loader on a scratch object,
+  with the path written between the caller's frame and the call's stack. So
+  the archive lookup, loose files and the stream decode are the game's own.
+  A record is removed before its fill runs. A failed fill leaves silence,
+  not stale bytes.
+- `guest_free` forgets records inside a freed block, since the heap hands
+  their address out again.
+- `ISAAC_SND_LAZY=0` turns it off. `ISAAC_SND_HASH=1` logs every upload's
+  hash. `ISAAC_SND_VERIFY=1` fills and hashes every sample at the first
+  upload after a heap report.
+- The heap report gains `written pages`: the 4 KB pages below the span that
+  hold a non-zero byte.
+
+**Checked.**
+
+- **Every sample, byte for byte.** `snd-check.mjs` with
+  `ISAAC_SND_VERIFY=1` ran lazy and not. All **1,538 of 1,538** samples were
+  identical, with 0 failed fills. Comparing against the archives' WAVs could
+  not prove this: the sound effects ship as Vorbis (21.125), so the game
+  reads decoded PCM.
+- **Selftest.** 14 checks on the table: record and find; off; empty;
+  overlap; one fill from the path, with the loader in fill mode; an upload
+  inside a buffer; a failed fill is silence; forgotten on free, its reused
+  address not filled; one upload over two buffers; a path without its end.
+
+**Measured.**
+
+| | lazy samples | read at load |
+|---|---|---|
+| arena pages written, at the title | **86.9 MiB** | 239.8 MiB |
+| the same after 30 s of play | 92.7 MiB | 245.5 MiB |
+| renderer working set (the OS's) | **553, 570 MB** | 719, 714 MB |
+| renderer footprint (Windows: commit) | 907, 980 MB | 906, 924 MB |
+| six floors: p99 / frames over 50 ms / longest | 16.8 ms / 17 / 367 ms | 16.8 ms / 15 / 467 ms |
+
+30 s of play filled 11 samples (0.2 MB). On Windows the footprint counts the
+memory committed at creation, so it does not move: the buffers are still
+allocated, only never written. The RAM the renderer holds falls by about
+155 MB. That is the figure for a phone, where an unwritten page is not
+resident.
+
+**Not yet.** The headers' reads still fetch and decode the whole 1 MiB
+windows around them, so the boot still decodes the sound windows.

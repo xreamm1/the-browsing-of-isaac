@@ -35,6 +35,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* Guest-visible scratch for the AL string answers. 0x0e006000 holds the GL
  * version string; module tokens start at 0x0e010000. 0x0e006100..0x0e006180
@@ -349,8 +350,20 @@ void imp_openal32__alGetSourcef(CpuState *restrict cpu) {
  *                   ALsizei size, ALsizei freq) */
 void imp_openal32__alBufferData(CpuState *restrict cpu) {
     al_hit("alBufferData");
-    isaac_audio_buffer_data(isaac_arg(cpu, 0), isaac_arg(cpu, 1), isaac_arg(cpu, 2),
-                            isaac_arg(cpu, 3), isaac_arg(cpu, 4));
+    uint32_t data = isaac_arg(cpu, 2), bytes = isaac_arg(cpu, 3);
+    /* round 98: a sample read header-only at load gets its PCM now (host_snd_lazy.c) */
+    isaac_snd_lazy_fill(cpu, data, bytes);
+    {   /* ISAAC_SND_HASH=1: each upload's bytes, hashed, to compare two builds' sounds */
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("ISAAC_SND_HASH"); on = (e && *e == '1') ? 1 : 0; }
+        if (on && bytes && isaac_is_guest_va(data) && isaac_is_guest_va(data + bytes - 1u)) {
+            uint32_t h = 2166136261u;
+            const uint8_t *p = (const uint8_t *)isaac_g(data);
+            for (uint32_t k = 0; k < bytes; ++k) h = (h ^ p[k]) * 16777619u;
+            isaac_log("[isaac][snd] alBufferData %u bytes fnv %08x", bytes, h);
+        }
+    }
+    isaac_audio_buffer_data(isaac_arg(cpu, 0), isaac_arg(cpu, 1), data, bytes, isaac_arg(cpu, 4));
     cpu->EAX = 0;
 }
 

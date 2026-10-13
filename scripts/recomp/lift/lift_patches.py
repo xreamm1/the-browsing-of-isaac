@@ -439,6 +439,46 @@ L_00a2b5c8: ;
     } }
   u3400_4 = (uint32_t)(EBP + ((uint32_t)0xfffff1c8u));
 """),
+    # Round 98: a sound sample's PCM is read when it is first played
+    # (host_snd_lazy.c). KAGE::Sound::SampleSourceWav's loader 0x00a7b6a0:
+    # pass 1 (0x00a9f630, header only) sizes the data chunk into [ebp-0x30],
+    # 0x00a230b0 allocates it into [edi+0x50], pass 2 (0x00a7b7f6) reads the
+    # PCM. The parser stores the fmt chunk and the size in either mode and
+    # only skips the read; every shipped WAV has its fmt before its data.
+    ("0x00a7b7f0",
+     "  RECOMP_VA(0xa7b7f0u);\n  u43f80_4 = ((uint32_t)0x0u);\n",
+     """  RECOMP_VA(0xa7b7f0u);
+  /* LIFT-PATCH 0x00a7b7f0 (round 98): pass 2's header-only flag. 1 when the
+     buffer is recorded to be filled on its first alBufferData; 0 (the PCM is
+     read now) when lazy samples are off, in a fill, or not recorded. */
+  { extern uint32_t isaac_snd_lazy_begin(uint32_t this_va, uint32_t path_va, uint32_t size);
+    u43f80_4 = isaac_snd_lazy_begin(EDI, EBX, MEMR32((uint32_t)(EBP + ((uint32_t)0xffffffd0u)))); }
+"""),
+    ("0x00a7b7dc",
+     "  RECOMP_VA(0xa7b7dcu);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, ((uint32_t)0xa7b7e1u));\n",
+     """  RECOMP_VA(0xa7b7dcu);
+  /* LIFT-PATCH 0x00a7b7dc (round 98): in a fill the buffer is the one
+     recorded at load. 0x00a230b0 is stdcall (ret 8): its two arguments are
+     popped as the call would have. */
+  { extern uint32_t isaac_snd_fill_target(void);
+    if (isaac_snd_fill_target()) {
+      EAX = isaac_snd_fill_target();
+      ESP = (uint32_t)(ESP + ((uint32_t)0x8u));
+      goto L_00a7b7e1;
+    } }
+  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));
+  MEMW32(ESP, ((uint32_t)0xa7b7e1u));
+"""),
+    ("0x00a7b806",
+     "L_00a7b806: ;\n  RECOMP_VA(0xa7b806u);\n",
+     """L_00a7b806: ;
+  RECOMP_VA(0xa7b806u);
+  /* LIFT-PATCH 0x00a7b806 (round 98): a fill returns once pass 2 has read
+     the PCM and the stream is deleted. The sample objects using the buffer
+     already hold its shared record; nothing after this is for a fill. */
+  { extern uint32_t isaac_snd_fill_target(void);
+    if (isaac_snd_fill_target()) goto L_00a7b81c; }
+"""),
 ]
 
 

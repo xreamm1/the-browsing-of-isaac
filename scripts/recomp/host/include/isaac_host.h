@@ -435,6 +435,27 @@ void   isaac_lazy_tex_stats(uint32_t *pending, uint32_t *deferred, uint32_t *mat
                             uint64_t *held, uint64_t *raw_pending);
 void   isaac_lazy_tex_report(void);
 
+/* host_snd_lazy.c (round 98): a sound sample's PCM is read when it is first
+ * played. The lift patches in SampleSourceWav's loader (0x00a7b6a0) call
+ * begin (pass 2's header-only flag) and fill_target (a fill's allocation and
+ * early return); the alBufferData shim calls fill, guest_free calls freed. */
+typedef int (*isaac_snd_filler)(isaac_cpu *cpu, uint32_t ptr, uint32_t size, const char *path);
+int      isaac_snd_lazy_enabled(void);
+void     isaac_snd_lazy_set_mode(int on);
+uint32_t isaac_snd_lazy_begin(uint32_t this_va, uint32_t path_va, uint32_t size);
+uint32_t isaac_snd_fill_target(void);
+int      isaac_snd_lazy_record(uint32_t ptr, uint32_t size, const char *path);
+int      isaac_snd_lazy_find(uint32_t ptr, uint32_t *size);
+uint32_t isaac_snd_lazy_pending(void);
+void     isaac_snd_lazy_freed(uint32_t p, uint32_t n);
+void     isaac_snd_lazy_fill(isaac_cpu *cpu, uint32_t va, uint32_t n);
+void     isaac_snd_lazy_set_filler(isaac_snd_filler f);
+void     isaac_snd_lazy_stats(uint32_t *pending, uint32_t *deferred, uint32_t *filled, uint32_t *forgotten,
+                              uint32_t *failed, uint64_t *bytes_pending, uint64_t *bytes_filled);
+void     isaac_snd_lazy_report(void);
+void     isaac_snd_verify_arm(void);
+void     isaac_snd_verify_set_mode(int on);
+
 #ifdef __cplusplus
 }
 #endif

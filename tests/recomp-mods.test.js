@@ -13,7 +13,8 @@ import { safeRel, modId, stripRoots, readMetadata, planMod, seedMods, disableTar
          GUEST_ROOT, USER_ROOT, GUEST_ROOTS, IMPORT_DIR, IMPORT_MARK, MODS_DB, IMPORT_METADATA } from '../scripts/recomp/web/mods.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const src = (f) => readFileSync(join(root, 'scripts', 'recomp', 'web', f), 'utf8');
+// a checkout with CRLF working files (core.autocrlf) reads the same as the LF one the pins are written against
+const src = (f) => readFileSync(join(root, 'scripts', 'recomp', 'web', f), 'utf8').replace(/\r\n/g, '\n');
 const bytes = (s) => new TextEncoder().encode(s);
 const named = (...names) => names.map((n) => ({ name: n, bytes: bytes(n) }));
 

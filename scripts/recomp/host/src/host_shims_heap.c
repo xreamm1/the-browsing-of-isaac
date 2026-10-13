@@ -198,6 +198,8 @@ static void guest_free(uint32_t p) {
     }
     g_stat.live -= sz;
     ++g_stat.frees;
+    /* round 98: a sample buffer freed before it was ever played was never written */
+    isaac_snd_lazy_freed(p, sz - HDR_BYTES - FTR_BYTES);
 
     /* Coalesce forward, then backward (the footer names the block before). */
     uint32_t nxt = b + sz;
@@ -417,6 +419,18 @@ void isaac_heap_report(void) {
         isaac_log("[isaac][heap]   free now       : %u blocks, %llu bytes, largest %u (corrupt frees refused: %u)",
                   fb, (unsigned long long)fbytes, fl, g_stat.corrupt);
     }
+    {   /* round 98: the 4 KB pages below the span that hold anything at all -- a page
+         * never written stays out of a phone's RAM, which the span cannot show */
+        uint32_t written = 0, top = g_heap_top > g_arena_lo ? g_heap_top : g_arena_lo;
+        for (uint32_t pg = g_arena_lo & ~0xfffu; pg < top; pg += 0x1000u) {
+            const uint64_t *w = (const uint64_t *)isaac_g(pg);
+            for (unsigned k = 0; k < 512u; ++k) if (w[k]) { ++written; break; }
+        }
+        isaac_log("[isaac][heap]   written pages  : %u (%.1f MiB) -- 4 KB pages below the span holding a non-zero byte",
+                  written, written / 256.0);
+    }
+    isaac_snd_lazy_report();
+    isaac_snd_verify_arm();                 /* ISAAC_SND_VERIFY=1: every sample hashed at the next upload */
     isaac_log("[isaac][heap] Move ISAAC_GUEST_LIMIT_VA / ISAAC_HEAP_SIZE to "
               "PEAK plus deliberate headroom, then GLOBAL_BASE and "
               "INITIAL_MEMORY follow from it.");

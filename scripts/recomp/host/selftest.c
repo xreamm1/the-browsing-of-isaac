@@ -421,6 +421,81 @@ static void test_lazy_textures(void) {
     }
     free(glyph); free(sprite); free(noise); free(back); free(code); free(g_up_px); g_up_px = NULL;
 }
+/* Round 98: a sound sample's PCM is read when it is first played (host_snd_lazy.c).
+ * The guest call that fills is replaced: the table, the fill's choice of buffers,
+ * the loader's fill mode and the forgetting on free are what is driven here. */
+static uint32_t g_sf_calls, g_sf_ptr, g_sf_size, g_sf_ok = 1, g_sf_begin, g_sf_target, g_sf_self, g_sf_path;
+static char g_sf_name[64];
+static int fake_sound_fill(CpuState *cpu, uint32_t ptr, uint32_t size, const char *path) {
+    (void)cpu;
+    ++g_sf_calls; g_sf_ptr = ptr; g_sf_size = size;
+    strncpy(g_sf_name, path, sizeof g_sf_name - 1);
+    g_sf_target = isaac_snd_fill_target();                       /* what the loader's patches see */
+    g_sf_begin = isaac_snd_lazy_begin(g_sf_self, g_sf_path, size);
+    if (g_sf_ok) memset(isaac_g(ptr), 0x5A, size);
+    return (int)g_sf_ok;
+}
+static void test_lazy_sound(void) {
+    const uint32_t S = ISAAC_STACK_TOP_VA - 0x80000u, self = S, path = S + 0x200u;
+    const uint32_t b1 = S + 0x1000u, b2 = S + 0x3000u, b3 = S + 0x5000u;
+    static const char p1[] = "sfx/tear fire 0.wav";
+    CpuState c; memset(&c, 0, sizeof c);
+    memset(isaac_g(S), 0, 0x8000);
+    memcpy(isaac_g(path), p1, sizeof p1);
+    g_sf_self = self; g_sf_path = path;
+    isaac_snd_lazy_set_mode(1);
+    isaac_snd_lazy_set_filler(fake_sound_fill);
+    isaac_w32(self + 0x50u, b1);
+    uint32_t sz = 0;
+    check(isaac_snd_lazy_begin(self, path, 0x800u) == 1u && isaac_snd_lazy_pending() == 1u && isaac_snd_lazy_find(b1, &sz) && sz == 0x800u,
+          "lazy sound: a loaded sample's buffer is recorded with pass 1's size, and pass 2 reads the header only");
+    isaac_snd_lazy_set_mode(0);
+    isaac_w32(self + 0x50u, b2);
+    check(isaac_snd_lazy_begin(self, path, 0x1000u) == 0u && isaac_snd_lazy_pending() == 1u,
+          "lazy sound: ISAAC_SND_LAZY=0 reads the PCM at load, as the game does");
+    isaac_snd_verify_set_mode(1);
+    check(isaac_snd_lazy_begin(self, path, 0x1000u) == 0u && isaac_snd_lazy_pending() == 1u,
+          "lazy sound: ISAAC_SND_VERIFY=1 with lazy samples off remembers the sample but still reads it at load");
+    isaac_snd_verify_set_mode(0);
+    isaac_snd_lazy_set_mode(1);
+    check(isaac_snd_lazy_begin(self, path, 0u) == 0u && isaac_snd_lazy_pending() == 1u, "lazy sound: an empty data chunk is read as the game does");
+    check(!isaac_snd_lazy_record(b1 + 0x100u, 0x100u, p1) && !isaac_snd_lazy_record(b1 - 0x10u, 0x20u, p1) && isaac_snd_lazy_pending() == 1u,
+          "lazy sound: a buffer overlapping a recorded one is refused");
+    check(isaac_snd_lazy_record(b2, 0x1000u, "sfx/b2.wav") && isaac_snd_lazy_record(b3, 0x800u, "sfx/b3.wav") && isaac_snd_lazy_pending() == 3u,
+          "lazy sound: three recorded");
+    memset(isaac_g(b1), 0xEE, 0x800u);
+    g_sf_calls = 0;
+    isaac_snd_lazy_fill(&c, b1, 0x800u);
+    check(g_sf_calls == 1u && g_sf_ptr == b1 && g_sf_size == 0x800u && !strcmp(g_sf_name, p1) && isaac_r32(b1 + 0x7fcu) == 0x5A5A5A5Au &&
+          !isaac_snd_lazy_find(b1, NULL) && isaac_snd_lazy_pending() == 2u,
+          "lazy sound: its first upload fills it once, through the loader, from its path");
+    check(g_sf_target == b1 && g_sf_begin == 0u && isaac_snd_fill_target() == 0u && isaac_snd_lazy_pending() == 2u,
+          "lazy sound: in the fill the loader allocates the recorded buffer and reads the PCM; after it, no fill");
+    isaac_snd_lazy_fill(&c, b1, 0x800u);
+    check(g_sf_calls == 1u, "lazy sound: later uploads find it filled");
+    isaac_snd_lazy_fill(&c, b2 + 0x10u, 0x20u);
+    check(g_sf_calls == 2u && g_sf_ptr == b2 && isaac_snd_lazy_pending() == 1u, "lazy sound: an upload inside a recorded buffer fills it");
+    g_sf_ok = 0;
+    memset(isaac_g(b3), 0xEE, 0x800u);
+    isaac_snd_lazy_fill(&c, b3, 0x800u);
+    check(g_sf_calls == 3u && isaac_r32(b3) == 0u && isaac_r32(b3 + 0x7fcu) == 0u && isaac_snd_lazy_pending() == 0u,
+          "lazy sound: a fill that fails leaves silence, not stale bytes, and is not tried again");
+    g_sf_ok = 1;
+    isaac_snd_lazy_record(b1, 0x800u, p1);
+    isaac_snd_lazy_record(b2, 0x1000u, p1);
+    isaac_snd_lazy_freed(b1 - 0x8u, 0x900u);
+    check(!isaac_snd_lazy_find(b1, NULL) && isaac_snd_lazy_find(b2, NULL), "lazy sound: a buffer freed unwritten is forgotten, its neighbour kept");
+    isaac_snd_lazy_fill(&c, b1, 0x800u);
+    check(g_sf_calls == 3u, "lazy sound: and its reused address is not filled");
+    isaac_snd_lazy_record(b3, 0x800u, p1);
+    isaac_snd_lazy_fill(&c, b2, 0x2800u);
+    check(g_sf_calls == 5u && isaac_snd_lazy_pending() == 0u, "lazy sound: an upload over two recorded buffers fills both");
+    memset(isaac_g(path), 'a', 0x800u);
+    isaac_w32(self + 0x50u, b1);
+    check(isaac_snd_lazy_begin(self, path, 0x800u) == 0u && isaac_snd_lazy_pending() == 0u,
+          "lazy sound: a path without its end within 1 KB is not recorded (its PCM is read at load)");
+    isaac_snd_lazy_set_filler(NULL);
+}
 static void test_thread_naps(void) {
     check(!isaac_threads_napping(0.0, 100.0), "thread naps: a job that never slept runs every frame");
     check(isaac_threads_napping(150.0, 100.0), "thread naps: a job whose Sleep ends at 150 sits out the frame at 100");
@@ -661,6 +736,7 @@ int main(int argc, char **argv) {
     test_render_gate();
     test_thread_naps();
     test_lazy_textures();
+    test_lazy_sound();
     test_eh();
     printf("--- isaac host layer selftest ---\n");
     if (argc > 1) load_image(argv[1]);
