@@ -146,7 +146,10 @@ LDFLAGS = [
     # never-drawn textures' pixels in the host heap, coded (~45-60 MB), and
     # the host's peak rose from 128 to 188 MiB -- at 640 the host had 192.
     # The textures they keep off the GPU are 225 MB at the title.
-    "-sINITIAL_MEMORY=738197504",
+    # Round 97d: 640 MiB again. The codes are smaller (LEB128 token headers:
+    # the boot's textures in 28.3 MB, not 35.1) and a kept texture is decoded
+    # a 4 MB band at a time, not into one buffer of up to 64 MB.
+    "-sINITIAL_MEMORY=671088640",
     "-sMAXIMUM_MEMORY=4294967296",
     "-sALLOW_MEMORY_GROWTH=1",
     "-sGLOBAL_BASE=469762048",

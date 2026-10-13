@@ -13,12 +13,20 @@
  * found bound at a draw (host_gl_webgl.c decides when; this file keeps the
  * bytes and gives them back exactly).
  *
- * The code: tokens of a u32 header, bit 31 set for a repeat of one value
- * (count in the low 31 bits, the value after it), clear for a literal run
- * (count values after it). A value is a whole pixel, or one byte where every
- * pixel of the texture is premultiplied gray (r == g == b == a: a white glyph
- * page). Measured on the boot's never-drawn textures: 235 MB of RGBA in 45 MB.
+ * The code: tokens of a LEB128 header, count << 1 | 1 for a repeat of one
+ * value (the value after it), count << 1 for a literal run (count values
+ * after it). A value is a whole pixel, or one byte where every pixel of the
+ * texture is premultiplied gray (r == g == b == a: a white glyph page).
+ * Round 97d replaced a u32 header per token: the dense CJK glyph pages are
+ * short runs, and the boot's textures (256.8 MB of RGBA) code to 28.3 MB
+ * instead of 35.1 (deflate would make 12.1, at about a second of boot CPU).
  * A texture whose code would be more than half its RGBA is uploaded as before.
+ *
+ * The pixels come back a band of rows at a time (4 MB, the GL transfer chunk
+ * of round 60), decoded straight from the code: round 97 decoded a whole
+ * texture into one buffer first, 64 MB at once for the largest glyph page,
+ * and that peak was the host heap's. With it gone the wasm memory is 640 MiB
+ * again (build_boot.py).
  *
  * Plain C (no GL here), so the selftest runs the codec and the table natively.
  * ISAAC_GL_LAZY_TEX=0 turns it off; ISAAC_GL_LAZY_MIN=<bytes> is the smallest
@@ -76,34 +84,56 @@ int isaac_lazy_gray(const uint8_t *px, uint32_t npix) {
     return 1;
 }
 
+/* a token header: count << 1 | repeat, LEB128 (1 byte up to a count of 63, 2 up to 8191) */
+static size_t put_head(uint8_t *out, size_t o, uint32_t count, uint32_t repeat) {
+    uint32_t v = (count << 1) | repeat;
+    size_t n = 0;
+    do {
+        uint8_t b = (uint8_t)(v & 0x7fu);
+        v >>= 7;
+        if (out) out[o + n] = (uint8_t)(b | (v ? 0x80u : 0u));
+        ++n;
+    } while (v);
+    return n;
+}
+static int get_head(const uint8_t *code, size_t len, size_t *p, uint32_t *v) {
+    uint32_t r = 0;
+    for (unsigned k = 0; k < 5; ++k) {
+        if (*p >= len) return 0;
+        uint8_t b = code[(*p)++];
+        if (k == 4 && b > 0x0fu) return 0;                    /* more than 32 bits */
+        r |= (uint32_t)(b & 0x7fu) << (7 * k);
+        if (!(b & 0x80u)) { *v = r; return 1; }
+    }
+    return 0;
+}
+
 /* The code of npix RGBA pixels into out (NULL: only its length). */
 size_t isaac_lazy_encode(const uint8_t *px, uint32_t npix, int gray, uint8_t *out) {
-    const uint32_t minrun = gray ? 8u : 3u, size = gray ? 1u : 4u;
+    const uint32_t minrun = gray ? 3u : 2u, size = gray ? 1u : 4u, most = 0x7fffffffu;
     size_t o = 0;
     uint32_t i = 0, lit = 0, litlen = 0;
 #define FLUSH() do { if (litlen) { \
-        if (out) { put32(out, o, litlen); \
-                   for (uint32_t k = 0; k < litlen; ++k) { \
-                       if (gray) out[o + 4 + k] = px[(size_t)(lit + k) * 4u + 3u]; \
-                       else memcpy(out + o + 4 + (size_t)k * 4u, px + (size_t)(lit + k) * 4u, 4); } } \
-        o += 4 + (size_t)litlen * size; litlen = 0; } } while (0)
+        o += put_head(out, o, litlen, 0u); \
+        if (out) for (uint32_t k = 0; k < litlen; ++k) { \
+            if (gray) out[o + k] = px[(size_t)(lit + k) * 4u + 3u]; \
+            else memcpy(out + o + (size_t)k * 4u, px + (size_t)(lit + k) * 4u, 4); } \
+        o += (size_t)litlen * size; litlen = 0; } } while (0)
     while (i < npix) {
         uint32_t v = pixel(px, i), r = 1;
-        while (i + r < npix && r < 0x7fffffffu && pixel(px, i + r) == v) ++r;
+        while (i + r < npix && r < most && pixel(px, i + r) == v) ++r;
         if (r >= minrun) {
             FLUSH();
-            if (out) {
-                put32(out, o, 0x80000000u | r);
-                if (gray) out[o + 4] = (uint8_t)(v >> 24); else put32(out, o + 4, v);
-            }
-            o += 4 + size;
+            o += put_head(out, o, r, 1u);
+            if (out) { if (gray) out[o] = (uint8_t)(v >> 24); else put32(out, o, v); }
+            o += size;
             i += r;
             lit = i;
         } else {
             if (!litlen) lit = i;
             litlen += r;
             i += r;
-            if (litlen >= 0x7fff0000u) FLUSH();
+            if (litlen >= most - 8u) FLUSH();
         }
     }
     FLUSH();
@@ -111,31 +141,51 @@ size_t isaac_lazy_encode(const uint8_t *px, uint32_t npix, int gray, uint8_t *ou
     return o;
 }
 
-/* The pixels back. 0 if the code does not describe exactly npix pixels. */
-int isaac_lazy_decode(const uint8_t *code, size_t len, int gray, uint8_t *px, uint32_t npix) {
+/* The next npix pixels of a code, from where the cursor stands (a zeroed
+ * cursor: the start). 0 if the code is malformed or ends first; a literal
+ * run is checked whole when its header is read, so a bad code never reads
+ * past its end, and nothing is written past npix pixels. */
+int isaac_lazy_decode_next(const uint8_t *code, size_t len, int gray, isaac_lazy_cursor *c,
+                           uint8_t *px, uint32_t npix) {
     const uint32_t size = gray ? 1u : 4u;
-    size_t p = 0;
     uint32_t i = 0;
-    while (p < len) {
-        if (len - p < 4) return 0;
-        uint32_t h = get32(code, p), n = h & 0x7fffffffu;
-        p += 4;
-        if (!n || n > npix - i) return 0;
-        if (h & 0x80000000u) {
-            if (len - p < size) return 0;
-            uint32_t v = gray ? 0x01010101u * code[p] : get32(code, p);
-            p += size;
-            for (uint32_t k = 0; k < n; ++k) put32(px, (size_t)(i + k) * 4u, v);
-        } else {
-            if ((len - p) / size < n) return 0;
-            if (gray) for (uint32_t k = 0; k < n; ++k) memset(px + (size_t)(i + k) * 4u, code[p + k], 4);
-            else memcpy(px + (size_t)i * 4u, code + p, (size_t)n * 4u);
-            p += (size_t)n * size;
+    while (i < npix) {
+        if (!c->left) {
+            uint32_t h;
+            if (!get_head(code, len, &c->p, &h) || !(h >> 1)) return 0;
+            c->left = h >> 1;
+            c->repeat = (uint8_t)(h & 1u);
+            if (c->repeat) {
+                if (len - c->p < size) return 0;
+                c->value = gray ? 0x01010101u * code[c->p] : get32(code, c->p);
+                c->p += size;
+            } else if ((len - c->p) / size < c->left) {
+                return 0;
+            }
         }
+        uint32_t n = c->left < npix - i ? c->left : npix - i;
+        if (c->repeat) {
+            for (uint32_t k = 0; k < n; ++k) put32(px, (size_t)(i + k) * 4u, c->value);
+        } else {
+            if (gray) for (uint32_t k = 0; k < n; ++k) memset(px + (size_t)(i + k) * 4u, code[c->p + k], 4);
+            else memcpy(px + (size_t)i * 4u, code + c->p, (size_t)n * 4u);
+            c->p += (size_t)n * size;
+        }
+        c->left -= n;
         i += n;
     }
-    return i == npix;
+    return 1;
 }
+
+/* The pixels back. 0 if the code does not describe exactly npix pixels. */
+int isaac_lazy_decode(const uint8_t *code, size_t len, int gray, uint8_t *px, uint32_t npix) {
+    isaac_lazy_cursor c = {0};
+    return isaac_lazy_decode_next(code, len, gray, &c, px, npix) && !c.left && c.p == len;
+}
+
+/* rows per upload band: the GL transfer chunk of round 60 (a test may shrink it) */
+static uint32_t g_lazy_band = 4u << 20;
+void isaac_lazy_set_band(uint32_t bytes) { g_lazy_band = bytes ? bytes : 4u << 20; }
 
 /* ---- the table ----------------------------------------------------------- */
 
@@ -191,23 +241,35 @@ int isaac_lazy_tex_defer(uint32_t name, uint32_t target, uint32_t level, uint32_
 }
 
 /* Give a kept texture its pixels: the upload is made through `up` (the texture
- * must be bound where `up` uploads), then the copy is freed. 1 if it was kept. */
+ * must be bound where `up` uploads), then the copy is freed. 1 if it was kept.
+ * A texture larger than a band is allocated first, then filled band by band
+ * from one band-sized buffer, decoded straight from the code. */
 int isaac_lazy_tex_materialize(uint32_t name, isaac_lazy_upload_fn up) {
     lazy_tex *t = lazy_get(name);
     if (!t) return 0;
-    uint32_t npix = t->w * t->h;
-    uint8_t *px = (uint8_t *)malloc((size_t)npix * 4u);
+    uint32_t row = t->w * 4u, rows = g_lazy_band / row;
+    if (!rows) rows = 1;
+    if (rows > t->h) rows = t->h;
+    uint8_t *px = (uint8_t *)malloc((size_t)rows * row);
     if (!px) {
         isaac_log("[isaac][gl] texture %u (%ux%u): no memory to give it its pixels; it stays empty", name, t->w, t->h);
         isaac_lazy_tex_drop(name);
         return 1;
     }
-    if (!isaac_lazy_decode(t->code, t->len, t->gray, px, npix))
+    isaac_lazy_cursor c = {0};
+    int ok = 1;
+    if (rows < t->h) up(t->target, t->level, t->ifmt, t->w, t->h, t->border, t->format, t->type, 0, 0, NULL);
+    for (uint32_t y = 0; y < t->h; y += rows) {
+        uint32_t n = t->h - y < rows ? t->h - y : rows;
+        if (ok && !isaac_lazy_decode_next(t->code, t->len, t->gray, &c, px, n * t->w)) ok = 0;
+        if (!ok) memset(px, 0, (size_t)n * row);
+        up(t->target, t->level, t->ifmt, t->w, t->h, t->border, t->format, t->type, y, n, px);
+    }
+    if (!ok || c.left || c.p != t->len)
         isaac_log("[isaac][gl] texture %u (%ux%u): its kept pixels do not decode", name, t->w, t->h);
-    up(t->target, t->level, t->ifmt, t->w, t->h, t->border, t->format, t->type, px);
     free(px);
     ++g_lazy_materialized;
-    g_lazy_raw_materialized += (uint64_t)npix * 4u;
+    g_lazy_raw_materialized += (uint64_t)t->w * t->h * 4u;
     isaac_lazy_tex_drop(name);
     return 1;
 }

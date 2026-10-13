@@ -284,6 +284,21 @@ static void tex_upload(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t 
     }
     glTexImage2D(target, (GLint)level, (GLint)ifmt, (GLsizei)w, (GLsizei)h, (GLint)border, format, type, px);
 }
+/* round 97d: a kept texture's pixels come back a band at a time (host_gl_lazy.c):
+ * no pixels allocates the level, a whole level is a plain upload, a band of rows
+ * goes into the level already allocated */
+static void lazy_upload(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h, uint32_t border,
+                        uint32_t format, uint32_t type, uint32_t y, uint32_t rows, const uint8_t *px) {
+    if (!px) {
+        glTexImage2D(target, (GLint)level, (GLint)ifmt, (GLsizei)w, (GLsizei)h, (GLint)border, format, type, NULL);
+        ++g_tex_banded;
+    } else if (y == 0 && rows == h) {
+        tex_upload(target, level, ifmt, w, h, border, format, type, px);
+    } else {
+        glTexSubImage2D(target, (GLint)level, 0, (GLint)y, (GLsizei)w, (GLsizei)rows, format, type, px);
+        ++g_tex_bands;
+    }
+}
 /* the 2D texture bound on the active unit (0: none known) */
 static uint32_t tex2d_bound(void) {
     uint32_t u = gls_unit_ok ? gls_unit - 0x84C0u : 0u;
@@ -299,7 +314,7 @@ static void lazy_before_draw(void) {
         if (s < 2u || !isaac_lazy_tex_pending(s - 1u)) continue;
         uint32_t active = gls_unit_ok ? gls_unit : 0x84C0u;
         if (active != 0x84C0u + u) glActiveTexture(0x84C0u + u);
-        isaac_lazy_tex_materialize(s - 1u, tex_upload);
+        isaac_lazy_tex_materialize(s - 1u, lazy_upload);
         if (active != 0x84C0u + u) glActiveTexture(active);
         ++g_lazy_at_draw;
     }
@@ -309,7 +324,7 @@ static void lazy_before_draw(void) {
 static void lazy_materialize_unbound(uint32_t name) {
     uint32_t prev = tex2d_bound();
     if (prev != name) glBindTexture(GL_TEXTURE_2D, name);
-    isaac_lazy_tex_materialize(name, tex_upload);
+    isaac_lazy_tex_materialize(name, lazy_upload);
     if (prev != name) glBindTexture(GL_TEXTURE_2D, prev);
 }
 
@@ -698,7 +713,7 @@ GLFN(glTexImage2D) {
          * another level needs level 0 there first */
         if (name && isaac_lazy_tex_pending(name)) {
             if (A(1) == 0u) isaac_lazy_tex_drop(name);
-            else isaac_lazy_tex_materialize(name, tex_upload);
+            else isaac_lazy_tex_materialize(name, lazy_upload);
         }
         if (name && isaac_lazy_tex_defer(name, A(0), A(1), A(2), A(3), A(4), A(5), A(6), A(7), (const uint8_t *)AP(8)))
             RET0;
@@ -711,7 +726,7 @@ GLFN(glTexSubImage2D) {
     ENTER;
     if (A(0) == GL_TEXTURE_2D) {                       /* round 97: written into: it needs its pixels first */
         uint32_t name = tex2d_bound();
-        if (name && isaac_lazy_tex_materialize(name, tex_upload)) ++g_lazy_at_write;
+        if (name && isaac_lazy_tex_materialize(name, lazy_upload)) ++g_lazy_at_write;
     }
     glTexSubImage2D(A(0), (GLint)A(1), (GLint)A(2), (GLint)A(3), (GLsizei)A(4), (GLsizei)A(5),
                     A(6), A(7), AP(8));

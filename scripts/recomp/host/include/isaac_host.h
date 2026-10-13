@@ -411,13 +411,21 @@ int  isaac_eh_tail(uint32_t cont, isaac_cpu *c);
 void isaac_eh_throw(isaac_cpu *restrict cpu);
 
 /* host_gl_lazy.c (round 97): a large texture reaches the GPU when first used.
- * The upload callback receives the deferred glTexImage2D's arguments. */
+ * The upload callback receives the deferred glTexImage2D's arguments and one
+ * band of rows (round 97d): px NULL allocates the level with no pixels; else
+ * rows [y, y + rows) of it -- the whole level when y is 0 and rows is h. */
 typedef void (*isaac_lazy_upload_fn)(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h,
-                                     uint32_t border, uint32_t format, uint32_t type, const uint8_t *px);
+                                     uint32_t border, uint32_t format, uint32_t type,
+                                     uint32_t y, uint32_t rows, const uint8_t *px);
+/* where a decode stands in a code: the next byte, and the run it is inside */
+typedef struct { size_t p; uint32_t left, value; uint8_t repeat; } isaac_lazy_cursor;
 int    isaac_lazy_tex_enabled(void);
 int    isaac_lazy_gray(const uint8_t *px, uint32_t npix);
 size_t isaac_lazy_encode(const uint8_t *px, uint32_t npix, int gray, uint8_t *out);
 int    isaac_lazy_decode(const uint8_t *code, size_t len, int gray, uint8_t *px, uint32_t npix);
+int    isaac_lazy_decode_next(const uint8_t *code, size_t len, int gray, isaac_lazy_cursor *c,
+                              uint8_t *px, uint32_t npix);
+void   isaac_lazy_set_band(uint32_t bytes);
 int    isaac_lazy_tex_pending(uint32_t name);
 void   isaac_lazy_tex_drop(uint32_t name);
 int    isaac_lazy_tex_defer(uint32_t name, uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h,

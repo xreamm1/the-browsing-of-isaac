@@ -246,16 +246,25 @@ static void test_eh(void) {
 int isaac_threads_napping(double wake_ms, double now_ms);
 /* Round 97: textures that reach the GPU when first used (host_gl_lazy.c). The
  * codec gives back exactly what it kept; the table keeps, gives back and drops. */
-static uint32_t g_up_calls, g_up_args[8];
+static uint32_t g_up_calls, g_up_args[8], g_up_allocs, g_up_bands, g_up_bad, g_up_w, g_up_h;
 static uint8_t *g_up_px;
+/* the GL side, as a picture: a level allocated (no pixels) or uploaded whole,
+ * and bands of rows written into the level allocated before them */
 static void lazy_capture(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h,
-                         uint32_t border, uint32_t format, uint32_t type, const uint8_t *px) {
+                         uint32_t border, uint32_t format, uint32_t type, uint32_t y, uint32_t rows, const uint8_t *px) {
     uint32_t a[8] = { target, level, ifmt, w, h, border, format, type };
     memcpy(g_up_args, a, sizeof a);
     ++g_up_calls;
-    free(g_up_px);
-    g_up_px = (uint8_t *)malloc((size_t)w * h * 4u);
-    if (g_up_px) memcpy(g_up_px, px, (size_t)w * h * 4u);
+    if (!px || (y == 0 && rows == h)) {
+        free(g_up_px);
+        g_up_px = (uint8_t *)calloc((size_t)w * h, 4u);
+        g_up_w = w; g_up_h = h;
+        if (!px) { ++g_up_allocs; return; }
+    } else {
+        ++g_up_bands;
+        if (!g_up_px || w != g_up_w || h != g_up_h || y + rows > h) { ++g_up_bad; return; }   /* a band with no level */
+    }
+    if (g_up_px) memcpy(g_up_px + (size_t)y * w * 4u, px, (size_t)rows * w * 4u);
 }
 static void test_lazy_textures(void) {
     enum { W = 256, H = 256, N = W * H };
@@ -333,6 +342,83 @@ static void test_lazy_textures(void) {
     isaac_lazy_tex_drop(13);
     isaac_lazy_tex_stats(&pending, NULL, NULL, NULL, &held, &raw);
     check(!isaac_lazy_tex_pending(13) && pending == 0 && held == 0 && raw == 0, "lazy textures: a deleted texture's copy is dropped");
+
+    /* round 97d: LEB128 token headers -- count << 1 | repeat, a byte up to a count of 63 */
+    {
+        uint8_t *run = (uint8_t *)malloc(16384 * 4), *rb = (uint8_t *)malloc(16384 * 4);
+        memset(run, 5, 64 * 4);
+        size_t l63 = isaac_lazy_encode(run, 63, 1, code), l64 = isaac_lazy_encode(run, 64, 1, code);
+        check(l63 == 2 && l64 == 3 && code[0] == 0x81 && code[1] == 0x01 && code[2] == 5,
+              "lazy textures: a gray run of 63 codes in 2 bytes, of 64 in 3 (header 0x81 0x01, then the value)");
+        for (int i = 0; i < 16384; ++i) memset(run + i * 4, i < 8191 ? 1 : 2, 4);
+        size_t lb = isaac_lazy_encode(run, 16384, 1, code);
+        check(lb == 7 && isaac_lazy_decode(code, lb, 1, rb, 16384) && !memcmp(rb, run, 16384 * 4),
+              "lazy textures: runs of 8191 and 8193 take 2- and 3-byte headers and come back exactly");
+        for (int i = 0; i < 16384; ++i) { uint8_t *p = run + i * 4; p[0] = (uint8_t)(i / 3); p[1] = 9; p[2] = (uint8_t)(i & 1); p[3] = 255; }
+        size_t lr = isaac_lazy_encode(run, 16384, 0, code);
+        check(isaac_lazy_decode(code, lr, 0, rb, 16384) && !memcmp(rb, run, 16384 * 4),
+              "lazy textures: whole pixels in runs of 3 and literals come back exactly");
+        free(run); free(rb);
+    }
+    {   /* a decode resumed anywhere gives the same pixels: chunks of 1,000 pixels */
+        size_t lg2 = isaac_lazy_encode(glyph, N, 1, code);
+        isaac_lazy_cursor c = {0};
+        int ok = 1;
+        memset(back, 0xA5, N * 4);
+        for (uint32_t at = 0; at < (uint32_t)N && ok; at += 1000u)
+            ok = isaac_lazy_decode_next(code, lg2, 1, &c, back + (size_t)at * 4u, (uint32_t)N - at < 1000u ? (uint32_t)N - at : 1000u);
+        check(ok && !c.left && c.p == lg2 && !memcmp(back, glyph, N * 4),
+              "lazy textures: the glyph page decoded 1,000 pixels at a time is the same, and the code is used up");
+    }
+    {   /* malformed codes are refused */
+        uint8_t px4[8 * 4];
+        /* each is otherwise a whole, valid code for the pixels asked, so only the rule named refuses it */
+        static const uint8_t zero_count[] = { 0x01, 0x05, 0x03, 0x07 }, cut_head[] = { 0x81 },
+                             wide_head[] = { 0x83, 0x80, 0x80, 0x80, 0x10, 0x05 }, long_head[] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x05 },
+                             cut_literal[] = { 0x0a, 1, 2, 3 };
+        check(!isaac_lazy_decode(zero_count, sizeof zero_count, 1, px4, 1) && !isaac_lazy_decode(cut_head, sizeof cut_head, 1, px4, 1),
+              "lazy textures: a run of nothing (before a good run of 1), or a header cut short, is refused");
+        check(!isaac_lazy_decode(wide_head, sizeof wide_head, 1, px4, 1) && !isaac_lazy_decode(long_head, sizeof long_head, 1, px4, 1),
+              "lazy textures: a header wider than 32 bits (its low bits a good run of 1), or longer than 5 bytes, is refused");
+        isaac_lazy_cursor cl = {0};
+        check(!isaac_lazy_decode_next(cut_literal, sizeof cut_literal, 1, &cl, px4, 5),
+              "lazy textures: a literal of 5 with 3 bytes left is refused before it is read, even mid-stream");
+        /* the run thresholds, which the code's size shows: gray repeats from 3, whole pixels from 2 */
+        static const uint8_t g7[] = { 1, 1, 1, 2, 9, 9, 4 };
+        uint8_t gp[7 * 4], cp[3 * 4];
+        for (int i = 0; i < 7; ++i) memset(gp + i * 4, g7[i], 4);
+        check(isaac_lazy_encode(gp, 7, 1, NULL) == 7, "lazy textures: gray 1 1 1 2 9 9 4 is a repeat of 3 and a literal of 4 (7 bytes)");
+        static const uint32_t aab[] = { 0x11223344u, 0x11223344u, 0x55667788u }, abc[] = { 1u, 2u, 3u };
+        memcpy(cp, aab, sizeof cp);
+        size_t laab = isaac_lazy_encode(cp, 3, 0, NULL);
+        memcpy(cp, abc, sizeof cp);
+        check(laab == 10 && isaac_lazy_encode(cp, 3, 0, NULL) == 13,
+              "lazy textures: pixels A A B are a repeat of 2 and a literal (10 bytes), A B C one literal (13)");
+        uint8_t tail[64 * 4];
+        for (int i = 0; i < 64; ++i) memset(tail + i * 4, i < 63 ? 7 : 9, 4);
+        size_t lt = isaac_lazy_encode(tail, 64, 1, code);
+        check(isaac_lazy_decode(code, lt, 1, back, 64) && !isaac_lazy_decode(code, lt, 1, back, 63),
+              "lazy textures: a code with a whole token left after the pixels asked for is refused");
+    }
+    {   /* bands: a texture larger than a band is allocated, then filled band by band */
+        g_up_calls = g_up_allocs = g_up_bands = g_up_bad = 0;
+        isaac_lazy_set_band(16u * W * 4u);
+        check(isaac_lazy_tex_defer(14, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, glyph) &&
+              isaac_lazy_tex_materialize(14, lazy_capture) && g_up_allocs == 1 && g_up_bands == 16 && g_up_calls == 17 &&
+              !g_up_bad && !memcmp(g_up_px, glyph, N * 4),
+              "lazy textures: 16-row bands -- one allocation, 16 bands, exactly the pixels");
+        g_up_calls = g_up_allocs = g_up_bands = g_up_bad = 0;
+        isaac_lazy_set_band(10u * W * 4u + 7u);
+        check(isaac_lazy_tex_defer(15, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, sprite) &&
+              isaac_lazy_tex_materialize(15, lazy_capture) && g_up_allocs == 1 && g_up_bands == 26 && !g_up_bad &&
+              !memcmp(g_up_px, sprite, N * 4),
+              "lazy textures: 10-row bands over 256 rows -- 25 of 10 and the last of 6");
+        isaac_lazy_set_band(0);
+        g_up_calls = g_up_allocs = g_up_bands = 0;
+        check(isaac_lazy_tex_defer(16, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, glyph) &&
+              isaac_lazy_tex_materialize(16, lazy_capture) && g_up_calls == 1 && !g_up_allocs && !g_up_bands,
+              "lazy textures: a texture within the 4 MB band is one whole upload");
+    }
     free(glyph); free(sprite); free(noise); free(back); free(code); free(g_up_px); g_up_px = NULL;
 }
 static void test_thread_naps(void) {

@@ -9372,3 +9372,69 @@ is 1 to 2 ms.
 **Shipped** as release 15: release 14's sources (005db8f) with only this
 change, built from a worktree (`.scratch/r97/build_engine_wt.py`). The lazy
 textures (21.126) are not in it.
+
+### 21.128 Round 97d: the lazy textures in 640 MiB
+
+Release 16 took the wasm memory from 640 to 704 MiB for the kept textures:
+the host heap's high-water rose from 128 to 188 MiB. Chromium commits the
+whole memory when it is created, so that is 64 MB on every machine.
+
+**Where the host's peak came from.** Two things:
+
+- **The codes.** A census of every texture the boot uploads
+  (`tex-codec-census.mjs`: 148 textures, 257.9 MB of RGBA, codes computed in
+  the page) priced the encodings. The four CJK glyph pages are most of it.
+  They are dense, short runs, and each token's u32 header was most of its
+  cost.
+
+| encoding of the kept textures | bytes |
+|---|---|
+| u32 token headers (round 97) | 35.1 MB |
+| LEB128 headers, `count << 1 \| repeat` | **28.3 MB** |
+| deflate (CompressionStream, for scale) | 12.1 MB |
+
+  Deflate would cost about a second of boot CPU on this machine, and more on
+  a phone, so the runs stay. Gray values repeat from 3 and whole pixels from
+  2.
+- **The decode.** A kept texture was decoded into one buffer before its
+  upload: 64 MB at once for the largest page. Now `isaac_lazy_decode_next`
+  resumes from a cursor, and `isaac_lazy_tex_materialize` fills a texture
+  larger than the 4 MB band (round 60's transfer chunk) band by band from one
+  band-sized buffer: the level is allocated, then `glTexSubImage2D` per band
+  (`lazy_upload` in `host_gl_webgl.c`).
+
+**Measured.** `lazy-check.mjs` (six floors, the pause menu) now also reads the
+memory's size and the host's touched high-water at the end:
+
+| | wasm memory | host high-water | renderer + GPU process at the title |
+|---|---|---|---|
+| release 16 | 704 MiB | 188.2 MiB | 1,226 and 1,195 MB |
+| this round | **640 MiB** (it never grew) | **158.5 MiB** | **1,151 and 1,144 MB** |
+
+That is 63 MB less on average over the two pairs, with the textures still off
+the GPU. On the same tour: 0 of 237,725 draws with an imageless texture, the
+most upload time in one frame 6.8 ms (was 7.5), and 13 frames over 50 ms (the
+floor loads; release 16 had 12). Speed is unchanged: 58.5 fps presented at
+164 Hz with nothing skipped; at 60 Hz, 60 fps and 457 ticks with no frame over
+25 ms; boot to frame 60 in 7.13 s (release 16: 7.16).
+
+**The guest arena, read on the way.** `window.isaacHeapReport()` in release
+16: the arena's peak live is **249.4 MiB of 384**, the same at the title and
+after play. It is touched to 249.6 MiB. The largest single block is 64 MiB:
+the game's own decode of the 4096x4096 glyph page at boot. The 350 MiB that
+round 69 sized the arena for is no longer the figure.
+
+**Checked.** The selftest has 11 new checks (707 in all):
+
+- LEB128 headers at 63/64 and 8191/8193;
+- whole pixels round-tripped;
+- a resumed decode, 1,000 pixels at a time;
+- refusals: a zero count, a cut header, a header over 32 bits or over 5
+  bytes, a literal past the end mid-stream, a token left over;
+- the run thresholds by code size;
+- bands of 16 rows and of 10 rows (25 + 6), and one whole upload within the
+  band.
+
+12 mutants were killed. One survives: zeroing a band after a corrupt kept
+code. The API cannot corrupt a kept code, so it is a defence only (round 97
+uploaded whatever the scratch held).
