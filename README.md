@@ -110,3 +110,14 @@ You need your own copy of the game; this repository has no game files in it.
 
 *The Binding of Isaac* belongs to Nicalis, Inc. and Edmund McMillen. This is a fan
 project, not affiliated with or endorsed by them.
+
+## License
+
+Copyright (C) 2026 chiikabu. This project's code is free software under the
+[GNU General Public License v3.0 or later](LICENSE).
+
+The license covers this project's own work only. It gives no rights to *The Binding of
+Isaac: Repentance+*: the game's code, assets and name belong to Nicalis, Inc. and
+Edmund McMillen, and so does anything recompiled or translated from its executable.
+[REPENTOGON](https://github.com/TeamREPENTOGON/REPENTOGON), included as a submodule,
+keeps its own license (GPL-2.0).
