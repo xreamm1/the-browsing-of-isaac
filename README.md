@@ -4,11 +4,10 @@
 
 **The Binding of Isaac: Repentance+, playable in a browser tab.**
 
-[![Play](https://img.shields.io/badge/PLAY-tboi.online-b03a2e?style=for-the-badge&labelColor=1d1512)](https://tboi.online)
-[![Stars](https://img.shields.io/github/stars/chiikabu/the-browsing-of-isaac?style=for-the-badge&logo=github&color=d7c9a7&labelColor=1d1512)](https://github.com/chiikabu/the-browsing-of-isaac/stargazers)
-[![Last commit](https://img.shields.io/github/last-commit/chiikabu/the-browsing-of-isaac?style=for-the-badge&color=7d7263&labelColor=1d1512)](https://github.com/chiikabu/the-browsing-of-isaac/commits/main)
-
-<img src="docs/media/gameplay.webp" alt="A run through the Basement: fights, the treasure room and the boss" width="800">
+[![Play](https://img.shields.io/badge/PLAY-xreamm1.github.io-b03a2e?style=for-the-badge&labelColor=1d1512)](https://xreamm1.github.io/the-browsing-of-isaac/)
+[![Stars](https://img.shields.io/github/stars/xreamm1/the-browsing-of-isaac?style=for-the-badge&logo=github&color=d7c9a7&labelColor=1d1512)](https://github.com/xreamm1/the-browsing-of-isaac/stargazers)
+[![Forks](https://img.shields.io/github/forks/xreamm1/the-browsing-of-isaac?style=for-the-badge&logo=github&color=7d7263&labelColor=1d1512)](https://github.com/xreamm1/the-browsing-of-isaac/forks)
+[![Last commit](https://img.shields.io/github/last-commit/xreamm1/the-browsing-of-isaac?style=for-the-badge&color=7d7263&labelColor=1d1512)](https://github.com/xreamm1/the-browsing-of-isaac/commits/main)
 
 </div>
 
@@ -20,8 +19,6 @@ It runs on desktop and on phones, keeps your saves in the browser, and can
 install mods from the game's own MODS menu.
 
 ## On a phone
-
-<p align="center"><img src="docs/media/phones.webp" width="800" alt="Playing upright and sideways on a phone"></p>
 
 There are no extra buttons on screen; you play by touching the game.
 
@@ -63,11 +60,7 @@ and start the run with it: the game gives player one to whichever device starts
 the run. Buttons are the Xbox layout, sticks are analog, and rumble follows the
 game's Rumble option. On the MODS screen, <kbd>X</kbd> opens the mod browser.
 
-<p align="center"><img src="docs/media/menus.webp" width="640" alt="Loading, the title screen and the main menu"></p>
-
 ## Mods
-
-<p align="center"><img src="docs/media/mods.webp" width="640" alt="Installing External Item Descriptions from the MODS screen, then using it in a run"></p>
 
 Mods from the Steam Workshop run here too, Lua and all. Open the game's
 **MODS** screen and click **MOD BROWSER** (press <kbd>B</kbd>, or tap it on a
@@ -93,17 +86,17 @@ You need your own copy of the game; this repository has no game files in it.
 
 ## Star history
 
-<a href="https://www.star-history.com/#chiikabu/the-browsing-of-isaac&Date">
+<a href="https://www.star-history.com/#xreamm1/the-browsing-of-isaac&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=chiikabu/the-browsing-of-isaac&type=Date&theme=dark">
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=chiikabu/the-browsing-of-isaac&type=Date">
-    <img alt="Star history" src="https://api.star-history.com/svg?repos=chiikabu/the-browsing-of-isaac&type=Date" width="640">
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=xreamm1/the-browsing-of-isaac&type=Date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=xreamm1/the-browsing-of-isaac&type=Date">
+    <img alt="Star history" src="https://api.star-history.com/svg?repos=xreamm1/the-browsing-of-isaac&type=Date" width="640">
   </picture>
 </a>
 
 ## Credits
 
-- Ported by chiikabu.
+- Ported by xreamm.
 - *The Binding of Isaac: Repentance+* is by Edmund McMillen and Nicalis.
 - The loading screen dance is the [Specialist dance](https://tenor.com/view/isaac-tboi-dance-gif-7352492888219360785) by dazlex.
 - Function signatures from [REPENTOGON](https://github.com/TeamREPENTOGON/REPENTOGON).
@@ -113,7 +106,7 @@ project, not affiliated with or endorsed by them.
 
 ## License
 
-Copyright (C) 2026 chiikabu. This project's code is free software under the
+Copyright (C) 2026 xreamm. This project's code is free software under the
 [GNU General Public License v3.0 or later](LICENSE).
 
 The license covers this project's own work only. It gives no rights to *The Binding of
