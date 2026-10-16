@@ -94,7 +94,7 @@ sees a resting pad meanwhile.
 ## Requirements
 
 - Your own copy of the game.
-- Python 3.11+ with `pypcode`, and Node.js 20+.
+- Python 3.11+ with `pypcode==3.3.3` (`pip install pypcode==3.3.3`), and Node.js 20+.
 - Emscripten 6.0.5+ with emsdk activated (set `EMSDK` if needed).
 - Ghidra and its Java runtime, for analysis and lifting.
 - A C++20 `clang++` for the native decomp checks (`CLANGXX`/`EMXX` override it).

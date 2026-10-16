@@ -297,6 +297,39 @@ def vnkey(vn):
     return (vn.space.name, vn.offset, vn.size)
 
 
+def unique_aliases(ops):
+    """Per instruction: map each unique read that lies inside a wider unique written
+    earlier to that writer. pypcode 4.x reads lanes of a wide temporary directly
+    (`XMM0_Db = unique[X+4:4]`) where 3.3.3 emitted `SUBPIECE unique[X:16], 4`; named by
+    exact (offset, size), such a read was a never-written C variable that clang folds to
+    0 (8,931 movups/movaps/andps/xorps/cvtdq2pd in the shipped .text). Returns
+    (alias, faults): faults maps op index -> reason for shapes this cannot express."""
+    alias, faults, written = {}, {}, []
+    for idx, op in enumerate(ops):
+        for v in op.inputs:
+            if v.space.name != "unique":
+                continue
+            k = (v.offset, v.size)
+            if k in written:
+                continue
+            enc = [w for w in written
+                   if w[0] <= v.offset and v.offset + v.size <= w[0] + w[1]]
+            if enc and alias.setdefault(k, enc[-1]) == enc[-1]:
+                continue
+            faults.setdefault(idx, "unique[%#x:%d] read with no covering write"
+                              % (v.offset, v.size))
+        o = op.output
+        if o is not None and o.space.name == "unique":
+            k = (o.offset, o.size)
+            if any(w != k and w[0] < o.offset + o.size and o.offset < w[0] + w[1]
+                   for w in written) or k in alias:
+                faults.setdefault(idx, "unique[%#x:%d] written over part of a wider temporary"
+                                  % (o.offset, o.size))
+            if k not in written:
+                written.append(k)
+    return alias, faults
+
+
 PCVAR = "pc_"
 
 
@@ -327,6 +360,7 @@ class FuncEmitter:
         self.callind_const = 0
         self.imports_used = set()
         self.const_ptr = {}
+        self.ualias, self.ufaults = {}, {}
         self.pshift_count = None
         self.uniques = OrderedDict()      # (off,size) -> cname
         self.roots = OrderedDict()        # root_name -> root_size (<=8)
@@ -347,13 +381,24 @@ class FuncEmitter:
 
     # --- varnode access -------------------------------------------------
     def uname(self, vn):
-        key = (vn.offset, vn.size)
+        return self._uvar(vn.offset, vn.size)
+
+    def _uvar(self, off, size):
+        key = (off, size)
         n = self.uniques.get(key)
         if n is None:
-            if vn.size not in UTYPE:
-                raise LiftError("unique size %d unsupported" % vn.size)
-            n = "u%x_%d" % (vn.offset, vn.size)
+            if size not in UTYPE:
+                raise LiftError("unique size %d unsupported" % size)
+            n = "u%x_%d" % (off, size)
             self.uniques[key] = n
+        return n
+
+    def _bigvar(self, off, size):
+        key = (off, size)
+        n = self.bigs.get(key)
+        if n is None:
+            n = "b%x_%d" % (off, size)
+            self.bigs[key] = n
         return n
 
     def rd(self, vn):
@@ -366,7 +411,16 @@ class FuncEmitter:
             sfx = "ull" if vn.size == 8 else "u"
             return "((%s)%#x%s)" % (UTYPE[vn.size], v, sfx)
         if sp == "unique":
-            return self.uname(vn)
+            al = self.ualias.get((vn.offset, vn.size))
+            if al is None:
+                return self.uname(vn)
+            base, bsize = al
+            if vn.size not in UTYPE:
+                raise LiftError("unique size %d unsupported" % vn.size)
+            delta = vn.offset - base
+            if bsize > 8:
+                return "recomp_rd%d(%s + %d)" % (vn.size * 8, self._bigvar(base, bsize), delta)
+            return "((%s)(%s >> %d))" % (UTYPE[vn.size], self._uvar(base, bsize), delta * 8)
         if sp == "register":
             root, rsize, boff = self.rm.resolve(vn.offset, vn.size)
             if vn.size not in UTYPE:
@@ -453,12 +507,10 @@ class FuncEmitter:
         """C expression yielding a uint8_t* to a wide varnode's storage."""
         sp = vn.space.name
         if sp == "unique":
-            key = (vn.offset, vn.size)
-            n = self.bigs.get(key)
-            if n is None:
-                n = "b%x_%d" % (vn.offset, vn.size)
-                self.bigs[key] = n
-            return n
+            al = self.ualias.get((vn.offset, vn.size))
+            if al is not None and not mutable:
+                return "(%s + %d)" % (self._bigvar(*al), vn.offset - al[0])
+            return self._bigvar(vn.offset, vn.size)
         if sp == "register":
             root, rsize, boff = self.rm.resolve(vn.offset, vn.size)
             self.bigroots[root] = rsize
@@ -633,6 +685,9 @@ class FuncEmitter:
         return "(uint8_t *)&%s" % t
 
     def lower(self, va, idx, op, next_va):
+        fault = self.ufaults.get(idx)
+        if fault:
+            raise LiftError(fault)
         oc = op.opcode
         o = op.output
         ins = op.inputs
@@ -1082,6 +1137,7 @@ class FuncEmitter:
             if need_l is None or va in need_l:
                 self.lines.append("L_%08x: ;" % va)
             self.const_ptr = {}
+            self.ualias, self.ufaults = unique_aliases(ops)
             self.pshift_count = packed_shift_defect(ops)
             for idx, op in enumerate(ops):
                 if need_p is None or (va, idx) in need_p:

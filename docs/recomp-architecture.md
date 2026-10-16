@@ -5196,7 +5196,7 @@ adoption of the page-made object.
 
 ```bash
 PY=python                           # any Python 3 environment you can pip-install into
-$PY -m pip install pypcode          # 3.3.3, vendors Ghidra SLEIGH
+$PY -m pip install pypcode==3.3.3   # vendors Ghidra SLEIGH; 4.x reads SSE lanes as sub-range uniques
 
 # function starts (9.6 s)
 $PY scripts/recomp/lift/scan.py tools/isaac-ng.unpacked.exe \
