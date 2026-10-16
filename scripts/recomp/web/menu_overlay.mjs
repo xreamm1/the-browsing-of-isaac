@@ -28,7 +28,7 @@ const PROMPT_WAIT_MS = 3000;      // how long the engine has to take the delete 
 const PROMPT_SETTLE_FRAMES = 20;  // frames the engine's prompt is given before it is answered
 const PROMPT_STEP_FRAMES = 8;     // frames between choosing YES on it and confirming
 // the credit on the menu paper (round 87)
-const CREDIT_TEXT = 'ported by chiikabu';
+const CREDIT_TEXT = 'ported by xreamm';
 
 export function parseBmfont(buf) {
   const b = new Uint8Array(buf), dv = new DataView(buf);
