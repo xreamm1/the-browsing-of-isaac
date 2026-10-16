@@ -119,12 +119,21 @@ static int web_context_ready(void) {
     at.enableExtensionsByDefault = 1;
     g_web_ctx = emscripten_webgl_create_context("#canvas", &at);
     if (g_web_ctx <= 0) {
-        isaac_log("[isaac][gl] emscripten_webgl_create_context failed (%d)", (int)g_web_ctx);
-        g_web_ctx = 0;
-        return 0;
+        /* Newer Emscripten with -lGL + JSPI pre-creates a WebGL2 context
+         * before main() runs; emscripten_webgl_create_context returns -1
+         * on a duplicate. Fall back to whatever context is already current. */
+        g_web_ctx = emscripten_webgl_get_current_context();
+        if (g_web_ctx <= 0) {
+            isaac_log("[isaac][gl] WebGL2 context unavailable (create=%d, current=%d)",
+                      (int)-1, (int)g_web_ctx);
+            g_web_ctx = 0;
+            return 0;
+        }
+        isaac_log("[isaac][gl] using pre-existing Emscripten WebGL2 context (%d)", (int)g_web_ctx);
+    } else {
+        isaac_log("[isaac][gl] WebGL2 context created on #canvas");
     }
     emscripten_webgl_make_context_current(g_web_ctx);
-    isaac_log("[isaac][gl] WebGL2 context created on #canvas");
     return 1;
 }
 int isaac_web_gl_ready(void) { return web_context_ready(); }
