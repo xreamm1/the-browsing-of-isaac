@@ -736,7 +736,7 @@ PROVIDER_JS = r"""
         return remember(s + ':' + i, await unpackWhole(s, i, await body(r, s, i, 0, size)));
       }
       status = r.status; await discard(r);
-      if (status === 404 || status === 410 || attempt === 3) throw new Error('piece ' + s + ':' + i + ': HTTP ' + status);
+      if (status === 410 || attempt === 3) throw new Error('piece ' + s + ':' + i + ': HTTP ' + status);
     }
   }
   function inWindow(p) {
