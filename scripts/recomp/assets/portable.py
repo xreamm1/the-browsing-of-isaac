@@ -724,16 +724,20 @@ PROVIDER_JS = r"""
     return pre ? pr : pr.then(function (u) { wasRead(key); return u; });
   }
   async function piece1(s, i) {
-    var r = await fetch(name(s, i)), size = chunkLen(s, i);
-    if (!r.ok) {
-      await discard(r);
-      throw new Error('piece ' + s + ':' + i + ': HTTP ' + r.status);
+    var size = chunkLen(s, i), status;
+    for (var attempt = 0; attempt < 4; attempt++) {
+      if (attempt) await new Promise(function (res) { setTimeout(res, attempt * 2000); });
+      var r = await fetch(name(s, i));
+      if (r.ok) {
+        if (!wholeHeader(r, size)) {
+          await discard(r);
+          throw new Error('piece ' + s + ':' + i + ': invalid whole response');
+        }
+        return remember(s + ':' + i, await unpackWhole(s, i, await body(r, s, i, 0, size)));
+      }
+      status = r.status; await discard(r);
+      if (status === 404 || status === 410 || attempt === 3) throw new Error('piece ' + s + ':' + i + ': HTTP ' + status);
     }
-    if (!wholeHeader(r, size)) {
-      await discard(r);
-      throw new Error('piece ' + s + ':' + i + ': invalid whole response');
-    }
-    return remember(s + ':' + i, await unpackWhole(s, i, await body(r, s, i, 0, size)));
   }
   function inWindow(p) {
     var st = S[p.s];
