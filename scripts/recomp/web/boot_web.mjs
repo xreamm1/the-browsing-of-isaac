@@ -31,6 +31,18 @@ function log(line) {
     logEl.textContent = window.isaacLog.slice(-12).join('\n');
   }
 }
+// isaac_log() reaches the page only through console.warn (EM_ASM in host_trap.c), never
+// print/printErr; mirror it so host diagnostics, abort reasons included, are in the log.
+{
+  const warn = console.warn.bind(console);
+  let inside = false;
+  console.warn = (...args) => {
+    warn(...args);
+    if (inside) return;
+    inside = true;
+    try { log(args.map(String).join(' ')); } catch (e) { /* best effort */ } finally { inside = false; }
+  };
+}
 
 // Synchronous binary fetch: the RAM-FS asks for lazy bytes from inside a
 // blocking call into wasm, so the answer cannot be awaited. A synchronous
@@ -74,6 +86,13 @@ const cfg = {
   canvas: document.getElementById('canvas'),
   print: log,
   printErr: log,
+  // abort() calls this before it sets ABORT, the last moment exports still run; stageOk's
+  // catch is too late for the VA ring and the stub report.
+  onAbort: (what) => {
+    try { log(`  !! onAbort: ${what}`); } catch (e) { /* best effort */ }
+    try { if (cfg._isaac_dump_va_ring) cfg._isaac_dump_va_ring(); } catch (e) { /* best effort */ }
+    try { if (cfg._isaac_stub_report) cfg._isaac_stub_report(); } catch (e) { /* best effort */ }
+  },
   instantiateWasm: hooks.instantiateWasm,     // round 34: the shipping page streams the module with a progress bar
   preRun: [() => {
     // a live page (ISAAC_YIELD=1) with no budget plays until it is closed
