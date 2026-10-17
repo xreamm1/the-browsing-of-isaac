@@ -1,4 +1,4 @@
-"""Source-level overrides applied to the GENERATED lifted C after every lift.
+﻿"""Source-level overrides applied to the GENERATED lifted C after every lift.
 
 Why this exists: the canonical target `tools/isaac-ng.unpacked.exe` carries
 19 runs / 172 bytes of this project's own emulator-era hand patches (diff it
@@ -34,46 +34,11 @@ MARKER = "/* LIFT-PATCH"
 # RECOMP_VA(<va>u) marker: mkdispatch.py / patch_reentry.py scan the lifted C
 # for those markers to build the dispatch table.
 PATCHES: dict[int, tuple[str, str]] = {
-    # Round 10 restored 0x009ab970's pristine prologue here so a "resources/"
-    # mount root was created. Round 11 REVERTED that: the instance is a
-    # ResourceExtractor dump with the archives' contents at the install
-    # ROOT, and KAGE's resolver (0x00a16c60) tries the archive index before a
-    # root's loose map, so a "resources/" root made the stale small archives
-    # (config.a = Afterbirth+ players.xml) shadow the extracted Repentance+
-    # files. With only the "" root, relative keys miss the archive index
-    # (keyed "resources/...") and resolve through the root scan.
-    #
-    # Round 24e brings it BACK, because that same miss is why the port was
-    # silent: the sound effects and the music exist only inside the archives
-    # (the dump has no sfx/ or music/ tree), and the archive index is keyed
-    # "resources/<path>" -- with no "resources/" root nothing ever hits it.
-    # The shadowing that round 11 saw is gone with it: the instance now
-    # mounts the whole archive set (afterbirth.a, afterbirthp.a,
-    # repentance.a; boot_integration.mjs LAZY_ARCHIVES), and the mount loop
-    # (0x00a179c0) overwrites an equal-hash entry, so the last-mounted
-    # archive -- repentance.a -- wins, exactly as it does in the real game.
-    0x009ab970: (
-        "restore `push ebp; mov ebp, esp` (pristine 55 8b ec; project patch 33 c0 c3 = "
-        "xor eax,eax; ret) so the resources/ mount root is created and scanned",
-        """void sub_009ab970(CpuState *restrict s) {
-  /* LIFT-PATCH 0x009ab970: the canonical exe carries an emulator-era hand patch
-     that turned this function's prologue into `xor eax, eax; ret`; the pristine
-     bytes (tools/isaac-ng.unpacked.exe.pre-coinit) are `push ebp; mov ebp, esp`
-     and the rest of the body is lifted as sub_009ab973 (Ghidra's orphaned
-     FUN_009ab973). Emulate the two lost instructions and fall into the body,
-     which ends with the function's own `mov esp, ebp; pop ebp; ret`. */
-  RECOMP_VA(0x9ab970u);
-  {
-    uint32_t ESP = s->ESP;
-    ESP = (uint32_t)(ESP - ((uint32_t)0x4u));
-    MEMW32(ESP, s->EBP);
-    s->ESP = ESP;
-    s->EBP = ESP;
-  }
-  sub_009ab973(s);
-}
-""",
-    ),
+    # 0x009ab970 was here in the canonical build to restore `push ebp; mov ebp, esp`
+    # (the canonical exe has an emulator-era hand patch 33 c0 c3 = xor eax,eax; ret).
+    # Our Repentance+ binary already has the pristine prologue 55 8b ec, so Ghidra
+    # lifts the full function as sub_009ab970 — no separate sub_009ab973 orphan.
+    # The patch is not needed and would cause a compile error (sub_009ab973 undeclared).
 }
 
 # --- block-level overrides ---------------------------------------------
@@ -174,8 +139,8 @@ BLOCK_PATCHES: list[tuple[str, str, str]] = [
 L_00aa27b0: ;
 """),
     ("0x00aa27f6",
-     "  RECOMP_VA(0xaa27f6u);\n  u3300_4 = (uint32_t)(EBP + ((uint32_t)0xfffffff4u));\n",
-     "L_00aa27f6: ;\n  /* LIFT-PATCH 0x00aa27f6: pair-loop join, before the original register reloads. */\n  RECOMP_VA(0xaa27f6u);\n  u3300_4 = (uint32_t)(EBP + ((uint32_t)0xfffffff4u));\n"),
+     "  RECOMP_VA(0xaa27f6u);\n  u6600_4 = (uint32_t)(EBP + ((uint32_t)0xfffffff4u));\n",
+     "L_00aa27f6: ;\n  /* LIFT-PATCH 0x00aa27f6: pair-loop join, before the original register reloads. */\n  RECOMP_VA(0xaa27f6u);\n  u6600_4 = (uint32_t)(EBP + ((uint32_t)0xfffffff4u));\n"),
     # Read the post-allocation layout once the original offsets are selected.
     # The guard precedes the label: rejected backedges must not retry it.
     ("0x00a678d1",
@@ -213,58 +178,38 @@ L_00a678d1: ;
     # Round 92: the vertex packer's per-quad scale. Eight divs and eight muls,
     # lifted one SSE instruction at a time, once per tear quad.
     ("0x00a67435",
-     "  RECOMP_VA(0xa67435u);\n  u3300_4 = (uint32_t)(EDI + ((uint32_t)0xfffffffcu));\n  ub900_1 = MEMR8(u3300_4);\n",
-     "  RECOMP_VA(0xa67435u);\n  /* LIFT-PATCH 0x00a67435 (round 92): the eight-float viewport scale in the\n     vertex packer. EDI is one past the 0x24-byte element, EDX is the scale\n     object. The lifted SSE from here to 0x00a6756c is that scale; jump to\n     the flag test that follows it. ZF is [ebp-0x38] == 0, as the cmp at\n     0x00a674ec leaves it, and EAX/EDX are the scale pointer the mul loop\n     reloads. */\n  isaac_fast_entity_quad_scale(EDI, EDX);\n  EDX = MEMR32((uint32_t)(ECX + ((uint32_t)0x8u)));\n  EAX = EDX;\n  u3300_4 = MEMR32((uint32_t)(EBP + ((uint32_t)0xffffffc8u)));\n  ZF = (uint8_t)(u3300_4 == ((uint32_t)0x0u));\n  goto L_00a67571;\n  u3300_4 = (uint32_t)(EDI + ((uint32_t)0xfffffffcu));\n  ub900_1 = MEMR8(u3300_4);\n"),
+     "  RECOMP_VA(0xa67435u);\n  u6600_4 = (uint32_t)(EDI + ((uint32_t)0xfffffffcu));\n  u17000_1 = MEMR8(u6600_4);\n",
+     "  RECOMP_VA(0xa67435u);\n  /* LIFT-PATCH 0x00a67435 (round 92): the eight-float viewport scale in the\n     vertex packer. EDI is one past the 0x24-byte element, EDX is the scale\n     object. The lifted SSE from here to 0x00a6756c is that scale; jump to\n     the flag test that follows it. ZF is [ebp-0x38] == 0, as the cmp at\n     0x00a674ec leaves it, and EAX/EDX are the scale pointer the mul loop\n     reloads. */\n  isaac_fast_entity_quad_scale(EDI, EDX);\n  EDX = MEMR32((uint32_t)(ECX + ((uint32_t)0x8u)));\n  EAX = EDX;\n  u6600_4 = MEMR32((uint32_t)(EBP + ((uint32_t)0xffffffc8u)));\n  ZF = (uint8_t)(u6600_4 == ((uint32_t)0x0u));\n  goto L_00a67571;\n  u6600_4 = (uint32_t)(EDI + ((uint32_t)0xfffffffcu));\n  u17000_1 = MEMR8(u6600_4);\n"),
     ("0x00a676fd",
-     "  RECOMP_VA(0xa676fdu);\n  u3300_4 = (uint32_t)(ESI + ((uint32_t)0x2cu));\n  u5280_4 = MEMR32(u3300_4);\n",
-     "  RECOMP_VA(0xa676fdu);\n  /* LIFT-PATCH 0x00a676fd (round 92): the four-corner tint. Each corner's\n     scalar multiplies its three floats and the dword after the corner is\n     cleared. ESI is the 112-byte quad. The join reloads ESI itself. */\n  isaac_fast_entity_quad_tint(ESI);\n  goto L_00a677fd;\n  u3300_4 = (uint32_t)(ESI + ((uint32_t)0x2cu));\n  u5280_4 = MEMR32(u3300_4);\n"),
+     "  RECOMP_VA(0xa676fdu);\n  u6600_4 = (uint32_t)(ESI + ((uint32_t)0x2cu));\n  ua300_4 = MEMR32(u6600_4);\n",
+     "  RECOMP_VA(0xa676fdu);\n  /* LIFT-PATCH 0x00a676fd (round 92): the four-corner tint. Each corner's\n     scalar multiplies its three floats and the dword after the corner is\n     cleared. ESI is the 112-byte quad. The join reloads ESI itself. */\n  isaac_fast_entity_quad_tint(ESI);\n  goto L_00a677fd;\n  u6600_4 = (uint32_t)(ESI + ((uint32_t)0x2cu));\n  ua300_4 = MEMR32(u6600_4);\n"),
     ("0x00a67571",
      "  RECOMP_VA(0xa67571u);\n  if (ZF) {\n    goto L_00a676f3;\n  }\n",
      "L_00a67571: ;\n  /* LIFT-PATCH 0x00a67571 (round 92): landing pad for the quad-scale patch. */\n  RECOMP_VA(0xa67571u);\n  if (ZF) {\n    goto L_00a676f3;\n  }\n"),
     # Round 85: mods. The leading slashes on every mod path (see the marker).
     ("0x00a171a5",
-     '  RECOMP_VA(0xa171a5u);\n  u3300_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  uba00_4 = MEMR32(u3300_4);\n  ESI = uba00_4;\n',
-     "  RECOMP_VA(0xa171a5u);\n  u3300_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  uba00_4 = MEMR32(u3300_4);\n  ESI = uba00_4;\n  /* LIFT-PATCH 0x00a171a5 (round 85): mods, all of them.\n     This is the resolver every mod file goes through -- metadata, main.lua,\n     every sprite and sound -- and it answers from an index of strings, never\n     from a filesystem. This port builds a mod's path off an empty base, so it\n     asks for //mods/<id>/... while the index holds mods/<id>/... . Two\n     characters, and nothing of any mod was ever found: the loader saw no\n     main.lua and skipped every mod whole. Step over the leading slashes. */\n  while (ESI && MEMR8(ESI) == (uint8_t)0x2fu) ESI = (uint32_t)(ESI + 1u);\n"),
+     '  RECOMP_VA(0xa171a5u);\n  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  u17200_4 = MEMR32(u6600_4);\n  ESI = u17200_4;\n',
+     "  RECOMP_VA(0xa171a5u);\n  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  u17200_4 = MEMR32(u6600_4);\n  ESI = u17200_4;\n  /* LIFT-PATCH 0x00a171a5 (round 85): mods, all of them.\n     This is the resolver every mod file goes through -- metadata, main.lua,\n     every sprite and sound -- and it answers from an index of strings, never\n     from a filesystem. This port builds a mod's path off an empty base, so it\n     asks for //mods/<id>/... while the index holds mods/<id>/... . Two\n     characters, and nothing of any mod was ever found: the loader saw no\n     main.lua and skipped every mod whole. Step over the leading slashes. */\n  while (ESI && MEMR8(ESI) == (uint8_t)0x2fu) ESI = (uint32_t)(ESI + 1u);\n"),
     # Round 81: achievements keep unlocking with mods on (see the marker text).
     ("0x009299e4",
-     '  RECOMP_VA(0x9299e4u);\n  u3300_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  ub900_1 = MEMR8(u3300_4);\n',
-     '  RECOMP_VA(0x9299e4u);\n  /* LIFT-PATCH 0x009299e4 (round 81): PersistentGameData::SetReadOnly reads its\n     argument here and stores it at [this+1]. That byte is the whole achievement\n     gate: TryUnlock (0x00929a20) tests it first and returns, and past it the\n     next thing it does is record the unlock. The game sets it while mods are\n     loaded, which is why a modded run earns nothing. Read the argument as\n     false: the flag is recorded, the log line still says what happened, and\n     nothing else about the save changes. */\n  u3300_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  ub900_1 = ((uint8_t)0x0u);\n'),
+     '  RECOMP_VA(0x9299e4u);\n  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  u17000_1 = MEMR8(u6600_4);\n',
+     '  RECOMP_VA(0x9299e4u);\n  /* LIFT-PATCH 0x009299e4 (round 81): PersistentGameData::SetReadOnly reads its\n     argument here and stores it at [this+1]. That byte is the whole achievement\n     gate: TryUnlock (0x00929a20) tests it first and returns, and past it the\n     next thing it does is record the unlock. The game sets it while mods are\n     loaded, which is why a modded run earns nothing. Read the argument as\n     false: the flag is recorded, the log line still says what happened, and\n     nothing else about the save changes. */\n  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x8u));\n  u17000_1 = ((uint8_t)0x0u);\n'),
     # Round 52: the save-select screen's EDIT FILE menu (see the marker text).
     ("0x009d9d59",
-     '  RECOMP_VA(0x9d9d59u);\n  u43f80_4 = ((uint32_t)0x0u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u43f80_4);\n  RECOMP_VA(0x9d9d5bu);\n  u44180_4 = ((uint32_t)0xb7fb20u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u44180_4);\n  RECOMP_VA(0x9d9d60u);\n  u5280_4 = ((uint32_t)0x2u);\n  MEMW32(EDI, u5280_4);\n',
-     '  RECOMP_VA(0x9d9d59u);\n  /* LIFT-PATCH 0x009d9d59 (round 52): the EDIT FILE menu. The confirm on a\n     file in delete mode is about to play "DeleteConfirmationAppear" and set\n     state 2; the page\'s menu opens instead (isaac_editfile_gate), and the\n     engine\'s own prompt runs only once that menu chose Delete. Skipping is\n     the exit the other branches take, with nothing pushed and no register\n     changed; the node build has no page, so the gate always says go. */\n  if (!isaac_editfile_gate(EDI)) {\n    goto L_009da447;\n  }\n  u43f80_4 = ((uint32_t)0x0u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u43f80_4);\n  RECOMP_VA(0x9d9d5bu);\n  u44180_4 = ((uint32_t)0xb7fb20u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u44180_4);\n  RECOMP_VA(0x9d9d60u);\n  u5280_4 = ((uint32_t)0x2u);\n  MEMW32(EDI, u5280_4);\n'),
+     '  RECOMP_VA(0x9d9d59u);\n  u84b00_4 = ((uint32_t)0x0u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u84b00_4);\n  RECOMP_VA(0x9d9d5bu);\n  u84f00_4 = ((uint32_t)0xb7fb20u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u84f00_4);\n  RECOMP_VA(0x9d9d60u);\n  ua300_4 = ((uint32_t)0x2u);\n  MEMW32(EDI, ua300_4);\n',
+     '  RECOMP_VA(0x9d9d59u);\n  /* LIFT-PATCH 0x009d9d59 (round 52): the EDIT FILE menu. The confirm on a\n     file in delete mode is about to play "DeleteConfirmationAppear" and set\n     state 2; the page\'s menu opens instead (isaac_editfile_gate), and the\n     engine\'s own prompt runs only once that menu chose Delete. Skipping is\n     the exit the other branches take, with nothing pushed and no register\n     changed; the node build has no page, so the gate always says go. */\n  if (!isaac_editfile_gate(EDI)) {\n    goto L_009da447;\n  }\n  u84b00_4 = ((uint32_t)0x0u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u84b00_4);\n  RECOMP_VA(0x9d9d5bu);\n  u84f00_4 = ((uint32_t)0xb7fb20u);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, u84f00_4);\n  RECOMP_VA(0x9d9d60u);\n  ua300_4 = ((uint32_t)0x2u);\n  MEMW32(EDI, ua300_4);\n'),
     ("0x00a2b5c2",
      """  RECOMP_VA(0xa2b5c2u);
 L_00a2b5c2: ;
-  goto L_00a2b6de;
+  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x14u));
+  u17000_1 = MEMR8(u6600_4);
 """,
      """  RECOMP_VA(0xa2b5c2u);
 L_00a2b5c2: ;
   /* LIFT-PATCH 0x00a2b5c2: pristine `cmp byte [ebp+0x14], 0; je 0xa2b5e1`
-     (80 7d 14 00 74 19). The project's emulator-era patch forced `jmp 0xa2b6de`
-     here, skipping the open of every sound source after its construction.
-     Both successors live in sub_00a2b5c7 (Ghidra split the tail off as its own
-     function), so this is a tail jump through that function's re-entry switch. */
-  u24d00_4 = (uint32_t)MEMR8((uint32_t)(EBP + ((uint32_t)0x14u)));
-  ZF = (uint8_t)(u24d00_4 == ((uint32_t)0x0u));
-  CF = ((uint8_t)0x0u);
-  OF = ((uint8_t)0x0u);
-  SF = ((uint8_t)0x0u);
-  PF = (uint8_t)(ZF ? 0x1u : 0x0u);
-  s->EBP = EBP;
-  s->ESP = ESP;
-  s->FS_OFFSET = FS_OFFSET;
-  s->EAX = EAX;
-  s->EBX = EBX;
-  s->ESI = ESI;
-  s->EDI = EDI;
-  s->ECX = ECX;
-  s->CF = CF;
-  s->OF = OF;
-  s->SF = SF;
-  s->ZF = ZF;
-  s->PF = PF;
-  recomp_jmp_target = ZF ? 0xa2b5e1u : 0xa2b5c8u; recomp_jmp_pending = 1u; return;
+     already correct in this binary version (no emulator-era patch applied). */
+  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x14u));
+  u17000_1 = MEMR8(u6600_4);
 """),
     # Round 86b: this used to anchor on `RECOMP_VA(0xa2b5c7u);`. Adding the 117
     # code-pointer-only functions (orphan_starts.py) repartitioned the TUs, and
@@ -273,29 +218,20 @@ L_00a2b5c2: ;
     # itself now, which is unmistakable and carries no label of its own; what
     # the lifter emits before it is left alone.
     ("0x00a2b5c8",
-     """  u3400_4 = (uint32_t)(EBX + ((uint32_t)0xc985104du));
-  u24700_4 = (uint32_t)CF;
-  u5280_4 = MEMR32(u3400_4);
-  CF = (uint8_t)(u5280_4 < ECX);
-  u5280_4 = MEMR32(u3400_4);
-  OF = (uint8_t)recomp_sborrow32(u5280_4, ECX);
-  u5280_4 = MEMR32(u3400_4);
-  u24900_4 = (uint32_t)(u5280_4 - ECX);
-  u24980_1 = (uint8_t)(u24900_4 < u24700_4);
-  CF = (uint8_t)((CF) | (u24980_1));
-  u24a80_1 = (uint8_t)recomp_sborrow32(u24900_4, u24700_4);
-  OF = (uint8_t)((OF) ^ (u24a80_1));
-  u5280_4 = (uint32_t)(u24900_4 - u24700_4);
-  MEMW32(u3400_4, u5280_4);
-  u5280_4 = MEMR32(u3400_4);
-  SF = (uint8_t)(((int32_t)u5280_4) < ((int32_t)((uint32_t)0x0u)));
-  u5280_4 = MEMR32(u3400_4);
-  ZF = (uint8_t)(u5280_4 == ((uint32_t)0x0u));
-  u5280_4 = MEMR32(u3400_4);
-  u24d00_4 = (uint32_t)(u5280_4 & ((uint32_t)0xffu));
-  u24d80_1 = (uint8_t)recomp_popcount32(u24d00_4);
-  u24e00_1 = (uint8_t)(u24d80_1 & ((uint8_t)0x1u));
-  PF = (uint8_t)(u24e00_1 == ((uint8_t)0x0u));
+     """  RECOMP_VA(0xa2b5c8u);
+  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x10u));
+  u17200_4 = MEMR32(u6600_4);
+  ECX = u17200_4;
+  RECOMP_VA(0xa2b5cbu);
+  CF = ((uint8_t)0x0u);
+  OF = ((uint8_t)0x0u);
+  ua4600_4 = (uint32_t)(ECX & ECX);
+  SF = (uint8_t)(((int32_t)ua4600_4) < ((int32_t)((uint32_t)0x0u)));
+  ZF = (uint8_t)(ua4600_4 == ((uint32_t)0x0u));
+  u49800_4 = (uint32_t)(ua4600_4 & ((uint32_t)0xffu));
+  u49900_1 = (uint8_t)recomp_popcount32(u49800_4);
+  u49a00_1 = (uint8_t)(u49900_1 & ((uint8_t)0x1u));
+  PF = (uint8_t)(u49a00_1 == ((uint8_t)0x0u));
   RECOMP_VA(0xa2b5cdu);
 """,
      """  /* LIFT-PATCH 0x00a2b5c8: Ghidra started this orphaned tail one byte early
@@ -304,25 +240,26 @@ L_00a2b5c2: ;
      0xa2b5c8, which sub_00a2b1e0's restored branch enters. */
 L_00a2b5c8: ;
   RECOMP_VA(0xa2b5c8u);
-  u3300_4 = (uint32_t)(EBP + ((uint32_t)0x10u));
-  ECX = MEMR32(u3300_4);
+  u6600_4 = (uint32_t)(EBP + ((uint32_t)0x10u));
+  u17200_4 = MEMR32(u6600_4);
+  ECX = u17200_4;
   RECOMP_VA(0xa2b5cbu);
   CF = ((uint8_t)0x0u);
   OF = ((uint8_t)0x0u);
-  u57480_4 = (uint32_t)(ECX & ECX);
-  SF = (uint8_t)(((int32_t)u57480_4) < ((int32_t)((uint32_t)0x0u)));
-  ZF = (uint8_t)(u57480_4 == ((uint32_t)0x0u));
-  u24d00_4 = (uint32_t)(u57480_4 & ((uint32_t)0xffu));
-  u24d80_1 = (uint8_t)recomp_popcount32(u24d00_4);
-  u24e00_1 = (uint8_t)(u24d80_1 & ((uint8_t)0x1u));
-  PF = (uint8_t)(u24e00_1 == ((uint8_t)0x0u));
+  ua4600_4 = (uint32_t)(ECX & ECX);
+  SF = (uint8_t)(((int32_t)ua4600_4) < ((int32_t)((uint32_t)0x0u)));
+  ZF = (uint8_t)(ua4600_4 == ((uint32_t)0x0u));
+  u49800_4 = (uint32_t)(ua4600_4 & ((uint32_t)0xffu));
+  u49900_1 = (uint8_t)recomp_popcount32(u49800_4);
+  u49a00_1 = (uint8_t)(u49900_1 & ((uint8_t)0x1u));
+  PF = (uint8_t)(u49a00_1 == ((uint8_t)0x0u));
   RECOMP_VA(0xa2b5cdu);
 """),
     ("0x00a2b5c7-reentry",
-     """    switch (_rva) {
+     """    case 0x00a2b5c2u: goto L_00a2b5c2;
     case 0x00a2b5ddu: goto L_00a2b5dd;
 """,
-     """    switch (_rva) {
+     """    case 0x00a2b5c2u: goto L_00a2b5c2;
     case 0x00a2b5c8u: goto L_00a2b5c8;   /* LIFT-PATCH 0x00a2b5c7-reentry */
     case 0x00a2b5e1u: goto L_00a2b5e1;
     case 0x00a2b5ddu: goto L_00a2b5dd;
@@ -363,7 +300,7 @@ L_00a2b5c8: ;
     # terminator is written (0x00a26fac), buffer at [ebp-0x10090], size in esi.
     ("0x00a26fb0-probe",
      """  RECOMP_VA(0xa26fb0u);
-  uba00_4 = MEMR32(EDI);
+  u17200_4 = MEMR32(EDI);
 """,
      """  RECOMP_VA(0xa26fb0u);
   { /* LIFT-PATCH 0x00a26fb0-probe */
@@ -376,7 +313,7 @@ L_00a2b5c8: ;
       isaac_probe_str(0xa26fb0u, "sta buffer head", b_);
       isaac_probe_str(0xa26fb1u, "sta buffer tail", (uint32_t)(b_ + ESI - 48u));
     } }
-  uba00_4 = MEMR32(EDI);
+  u17200_4 = MEMR32(EDI);
 """),
     # ... and the stream object itself (edi): its address, vtable and read
     # position, to see whether it overlaps the buffer.
@@ -424,7 +361,7 @@ L_00a2b5c8: ;
     ("0x00a17cee",
      """L_00a17cee: ;
   RECOMP_VA(0xa17ceeu);
-  u3400_4 = (uint32_t)(EBP + ((uint32_t)0xfffff1c8u));
+  u6800_4 = (uint32_t)(EBP + ((uint32_t)0xfffff1c8u));
 """,
      """L_00a17cee: ;
   RECOMP_VA(0xa17ceeu);
@@ -437,7 +374,7 @@ L_00a2b5c8: ;
       EDI = MEMR32((uint32_t)(EBP + ((uint32_t)0xfffff194u)));
       goto L_00a17dc1;
     } }
-  u3400_4 = (uint32_t)(EBP + ((uint32_t)0xfffff1c8u));
+  u6800_4 = (uint32_t)(EBP + ((uint32_t)0xfffff1c8u));
 """),
     # Round 98: a sound sample's PCM is read when it is first played
     # (host_snd_lazy.c). KAGE::Sound::SampleSourceWav's loader 0x00a7b6a0:
@@ -446,13 +383,13 @@ L_00a2b5c8: ;
     # PCM. The parser stores the fmt chunk and the size in either mode and
     # only skips the read; every shipped WAV has its fmt before its data.
     ("0x00a7b7f0",
-     "  RECOMP_VA(0xa7b7f0u);\n  u43f80_4 = ((uint32_t)0x0u);\n",
+     "  RECOMP_VA(0xa7b7f0u);\n  u84b00_4 = ((uint32_t)0x0u);\n",
      """  RECOMP_VA(0xa7b7f0u);
   /* LIFT-PATCH 0x00a7b7f0 (round 98): pass 2's header-only flag. 1 when the
      buffer is recorded to be filled on its first alBufferData; 0 (the PCM is
      read now) when lazy samples are off, in a fill, or not recorded. */
   { extern uint32_t isaac_snd_lazy_begin(uint32_t this_va, uint32_t path_va, uint32_t size);
-    u43f80_4 = isaac_snd_lazy_begin(EDI, EBX, MEMR32((uint32_t)(EBP + ((uint32_t)0xffffffd0u)))); }
+    u84b00_4 = isaac_snd_lazy_begin(EDI, EBX, MEMR32((uint32_t)(EBP + ((uint32_t)0xffffffd0u)))); }
 """),
     ("0x00a7b7dc",
      "  RECOMP_VA(0xa7b7dcu);\n  ESP = (uint32_t)(ESP - ((uint32_t)0x4u));\n  MEMW32(ESP, ((uint32_t)0xa7b7e1u));\n",
