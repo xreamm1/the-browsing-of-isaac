@@ -199,7 +199,7 @@
 <main>
   <div id="credit">ported by xreamm</div>
   <div id="net" hidden></div>
-  <div id="saved" role="status" hidden>СОХРАНЕНО</div>
+  <div id="saved" role="status" hidden>SAVED</div>
   <div id="fps-mini" hidden></div>
   <div id="fps-note" hidden></div>
   <button id="fs-btn" type="button" aria-label="Fullscreen" title="Fullscreen" data-touch-ui hidden>&#x26F6;</button>
@@ -1391,7 +1391,7 @@ function isaacRecipeDecode(src, vorbis) {
       el.textContent = ''; el.appendChild(c); el.setAttribute('aria-label', text); el.dataset.dressed = '1';
     }
     function showSaved() {
-      dress(notice, 'СОХРАНЕНО', 3, null, true);
+      dress(notice, 'SAVED', 3, null, true);
       notice.hidden = false; notice.style.opacity = '1';
       clearTimeout(hideTimer);
       hideTimer = setTimeout(function () { notice.style.opacity = '0'; hideTimer = setTimeout(function () { notice.hidden = true; }, 400); }, 3000);
