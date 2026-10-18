@@ -30,11 +30,11 @@
     device: (mobile ? (/iPhone|iPad/.test(ua) ? 'iOS' : 'Android') + ' phone' : 'Computer')
       + (ram ? ' · ' + (ram >= 8 ? '8+' : ram) + ' GB' : '') + (cores ? ' · ' + cores + ' cores' : '')
       + ' · ' + (is64 ? '64' : '32') + '-bit browser' };
-  if (!mobile || typeof WebAssembly === 'undefined') return;
+  if (!mobile || typeof WebAssembly === 'undefined' || typeof WebAssembly.Suspending !== 'function') return;
   // The heap reaches ~673 MiB (10767 pages) in the menu, so the maximum stays above that while possible.
   // A 32-bit renderer's address space is the limit: every MiB reserved past the heap's need
   // is a MiB the compiled code and the page's buffers cannot have.
-  var tries = [[7680, 12288], [7680, 11264], [7552, 9216], [7440, 7440]];
+  var tries = [[7680, 12288], [7680, 11264], [7552, 9216]];
   if (is64) tries.unshift([7680, 65536]);
   for (var i = 0; i < tries.length; i++) {
     try {
@@ -663,6 +663,7 @@ function isaacRecipeDecode(src, vorbis) {
     }
   }
   function remember(key, u) {
+    if (S[Number(key.split(':')[0])].gz) keepSmall(key, u);
     var old = cache.get(key);
     if (old) { cache.delete(key); cacheBytes -= old.length; }
     cache.set(key, u); cacheBytes += u.length;
@@ -684,12 +685,16 @@ function isaacRecipeDecode(src, vorbis) {
     for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i);
     return a;
   })() : null;
+  // The key stream repeats every 64 KiB: one table, one XOR per byte.
+  var KEYSTREAM = null;
   function unscramble(bytes, pos) {
     if (!KEY) return bytes;
-    for (var i = 0; i < bytes.length; i++) {
-      var at = pos + i;
-      bytes[i] ^= KEY[at & 255] ^ ((at >> 8) & 255);
+    if (!KEYSTREAM) {
+      KEYSTREAM = new Uint8Array(65536);
+      for (var j = 0; j < 65536; j++) KEYSTREAM[j] = KEY[j & 255] ^ ((j >> 8) & 255);
     }
+    var t = KEYSTREAM;
+    for (var i = 0, at = pos & 65535; i < bytes.length; i++, at = (at + 1) & 65535) bytes[i] ^= t[at];
     return bytes;
   }
   function count(s) { return S[s].stored.length; }
@@ -777,7 +782,7 @@ function isaacRecipeDecode(src, vorbis) {
     if (!r.body) return;
     try { await r.body.cancel(); } catch (e) { /* retain the original response error */ }
   }
-  async function body(r, s, i, from, size) {
+  async function body(r, s, i, from, size, tick) {
     var d = downloads[s][i], u, n = 0;
     if (r.body && r.body.getReader) {
       var reader = r.body.getReader();
@@ -788,6 +793,7 @@ function isaacRecipeDecode(src, vorbis) {
           if (part.done) break;
           if (n + part.value.length > size) throw new Error('piece ' + s + ':' + i + ': wrong body length');
           u.set(part.value, n); n += part.value.length;
+          if (tick) tick();
           // Do not claim the entire response until EOF validates its length.
           if (n < size) record(d, from, from + n, false);
         }
@@ -861,7 +867,8 @@ function isaacRecipeDecode(src, vorbis) {
     return z === '1' ? await inflate(stored) : stored;
   }
   async function unpackWhole(s, i, raw) {
-    if (S[s].wl) return raw;
+    // Unpacked streams stay scrambled in the cache; slicePiece unscrambles only the bytes a read takes.
+    if (S[s].wl || !S[s].gz) return raw;
     unscramble(raw, i * S[s].size);
     return packed(s, i) ? await inflate(raw) : raw;
   }
@@ -899,10 +906,21 @@ function isaacRecipeDecode(src, vorbis) {
     var size = chunkLen(s, i), status, last = 5, url = name(s, i), store = await chunkStore();
     for (var attempt = 0; attempt <= last; attempt++) {
       if (attempt) await new Promise(function (res) { setTimeout(res, attempt * 2000); });
-      var r = null, raw, fromStore = false;
+      var r = null, raw, fromStore = false, ac = null, idle = 0;
       if (store) { try { r = await store.match(url); fromStore = !!r; } catch (e) { r = null; } }
+      // A stalled connection never settles: abort after 30 s without a byte, then retry.
+      var arm = function () {
+        if (!ac) return;
+        clearTimeout(idle);
+        idle = setTimeout(function () { ac.abort(); }, 30000);
+      };
       // A dropped mobile connection rejects fetch() or the body read; both retry like a bad status.
-      if (!r) { try { r = await fetch(url); } catch (e) { if (attempt === last) throw e; continue; } }
+      if (!r) {
+        ac = typeof AbortController === 'function' ? new AbortController() : null;
+        arm();
+        try { r = await fetch(url, ac ? { signal: ac.signal } : undefined); }
+        catch (e) { clearTimeout(idle); if (attempt === last) throw e; continue; }
+      }
       if (r.ok) {
         if (!wholeHeader(r, size)) {
           await discard(r);
@@ -910,13 +928,16 @@ function isaacRecipeDecode(src, vorbis) {
           throw new Error('piece ' + s + ':' + i + ': invalid whole response');
         }
         if (store && !fromStore) { try { store.put(url, r.clone()).catch(function () {}); } catch (e) {} }
-        try { raw = await body(r, s, i, 0, size); } catch (e) {
+        try { raw = await body(r, s, i, 0, size, ac ? arm : null); } catch (e) {
+          clearTimeout(idle);
           if (fromStore) { store.delete(url).catch(function () {}); continue; }
           if (attempt === last) throw e;
           continue;
         }
+        clearTimeout(idle);
         return remember(s + ':' + i, await unpackWhole(s, i, raw));
       }
+      clearTimeout(idle);
       status = r.status; await discard(r);
       if (status === 410 || attempt === last) throw new Error('piece ' + s + ':' + i + ': HTTP ' + status);
     }
@@ -932,7 +953,10 @@ function isaacRecipeDecode(src, vorbis) {
   }
   async function slicePiece(p, u) {
     var w = inWindow(p);
-    if (!w) return u.subarray(p.within, p.within + p.take);
+    if (!w) {
+      if (S[p.s].gz) return u.subarray(p.within, p.within + p.take);
+      return unscramble(u.slice(p.within, p.within + p.take), p.i * S[p.s].size + p.within);
+    }
     var stored = u.subarray(w.from, w.to + 1);
     // Unscrambling a shared subarray would corrupt every subsequent read.
     if (KEY) stored = unscramble(stored.slice(), w.abs);
@@ -1109,6 +1133,22 @@ function isaacRecipeDecode(src, vorbis) {
   // loose resources: 2.4 MB) are copied out and kept; the chunks go. Anything else read
   // later fetches its chunk again.
   var kept = Object.create(null), KEEP_MAX = WIN;
+  function keepSmall(key, u) {
+    var names = Object.keys(P.files);
+    for (var j = 0; j < names.length; j++) {
+      var f = P.files[names[j]];
+      if (!S[f.s].gz || f.size > KEEP_MAX || kept[names[j]]) continue;
+      var parts = span(f.s, f.at, f.at + f.size);
+      if (!parts.some(function (q) { return q.s + ':' + q.i === key; })) continue;
+      var out = new Uint8Array(f.size), ok = true;
+      for (var q = 0; q < parts.length; q++) {
+        var c = parts[q].s + ':' + parts[q].i === key ? u : cache.get(parts[q].s + ':' + parts[q].i);
+        if (!c) { ok = false; break; }
+        out.set(c.subarray(parts[q].within, parts[q].within + parts[q].take), parts[q].at);
+      }
+      if (ok) kept[names[j]] = out;
+    }
+  }
   function release() {
     var names = Object.keys(P.files), n = 0, freed = 0;
     for (var j = 0; j < names.length; j++) {
@@ -1129,15 +1169,21 @@ function isaacRecipeDecode(src, vorbis) {
       forget(keys[k]);
     }
     if (!PROFILE.rest && !storing) { storing = true; storeRest(); }
-    return { kept: n, freed: freed };
+    return { kept: Object.keys(kept).length, freed: freed };
   }
   // Phones do not prefetch the payload into memory. Once the boot is done they copy the
   // remaining chunks straight to Cache Storage, one at a time and only while the game is not
   // waiting on a read, so a run's first rooms come off disk instead of the network.
   var storing = false, storedN = 0, storeTotal = 0, storeAt = '', storeErr = '';
   async function storeRest() {
+    try { await storeRest1(); } finally { storing = false; }
+  }
+  async function storeRest1() {
+    var conn = navigator.connection;
+    if (conn && conn.saveData) { storeErr = 'Save-Data is on'; return; }
     var store = await chunkStore();
     if (!store) return;
+    var fails = 0;
     var jobs = [];
     for (var s = 0; s < S.length; s++) if (!S[s].gz) for (var i = 0; i < count(s); i++) jobs.push([s, i]);
     storeTotal = jobs.length;
@@ -1151,11 +1197,15 @@ function isaacRecipeDecode(src, vorbis) {
       var timer = ac ? setTimeout(function () { ac.abort(); }, 90000) : 0;
       try {
         var r = await fetch(url, ac ? { signal: ac.signal } : undefined);
-        if (r.ok && wholeHeader(r, chunkLen(jobs[j][0], jobs[j][1]))) { await store.put(url, r); storedN++; }
-        else { storeErr = 'HTTP ' + r.status; await discard(r); }
+        if (r.ok && wholeHeader(r, chunkLen(jobs[j][0], jobs[j][1]))) { await store.put(url, r); storedN++; fails = 0; }
+        else {
+          storeErr = 'HTTP ' + r.status; await discard(r);
+          // Retry a bad answer a few times; then leave that chunk to on-demand reads.
+          if (++fails < 4) { j--; await new Promise(function (res) { setTimeout(res, 5000); }); } else { fails = 0; storeTotal--; }
+        }
       } catch (e) {
         storeErr = String(e && e.message || e);
-        if (e && e.name === 'QuotaExceededError') { storing = false; return; }
+        if (e && e.name === 'QuotaExceededError') return;
         j--; await new Promise(function (res) { setTimeout(res, 5000); });
       }
       finally { clearTimeout(timer); }
