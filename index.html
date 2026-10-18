@@ -17,15 +17,16 @@
   var ram = navigator.deviceMemory || 0, cores = navigator.hardwareConcurrency || 0;
   // Whole 27 MB chunks: how many the loader caches, downloads at once and fetches ahead.
   var PROFILES = {
-    fast: { label: 'Fast', cacheMB: 256, width: 6, ahead: 8 },
-    optimized: { label: 'Optimized', cacheMB: 160, width: 3, ahead: 4 },
-    economy: { label: 'Economy', cacheMB: 64, width: 2, ahead: 2 }
+    // rest: also prefetch the chunks the boot trail does not name (the whole ~1 GB payload).
+    fast: { label: 'Fast', cacheMB: 256, width: 6, ahead: 8, rest: true },
+    optimized: { label: 'Optimized', cacheMB: 160, width: 3, ahead: 4, rest: false },
+    economy: { label: 'Economy', cacheMB: 96, width: 2, ahead: 2, rest: false }
   };
   var id = !is64 ? 'economy' : (mobile || (ram && ram <= 4)) ? 'optimized' : 'fast';
   var forced = new URLSearchParams(location.search).get('profile');
   if (forced && PROFILES[forced]) id = forced;
   var p = PROFILES[id];
-  window.__isaacProfile = { id: id, label: p.label, cacheMB: p.cacheMB, width: p.width, ahead: p.ahead, forced: !!(forced && PROFILES[forced]),
+  window.__isaacProfile = { id: id, label: p.label, cacheMB: p.cacheMB, width: p.width, ahead: p.ahead, rest: p.rest, forced: !!(forced && PROFILES[forced]),
     device: (mobile ? (/iPhone|iPad/.test(ua) ? 'iOS' : 'Android') + ' phone' : 'Computer')
       + (ram ? ' · ' + (ram >= 8 ? '8+' : ram) + ' GB' : '') + (cores ? ' · ' + cores + ' cores' : '')
       + ' · ' + (is64 ? '64' : '32') + '-bit browser' };
@@ -607,7 +608,7 @@ function isaacRecipeDecode(src, vorbis) {
 
 (function () {
   var P = window.__isaacPortableData, S = P.streams;
-  var PROFILE = window.__isaacProfile || { cacheMB: 256, ahead: 8, width: 6 };
+  var PROFILE = window.__isaacProfile || { cacheMB: 256, ahead: 8, width: 6, rest: true };
   var WIN = 1048576, CACHE_MAX = PROFILE.cacheMB * WIN, AHEAD = PROFILE.ahead, STREAM_WIDTH = PROFILE.width;
   // Whole-read chunks are unwrapped once. Windowed chunks keep their stored,
   // scrambled bytes: only a demanded window is copied, unscrambled and inflated.
@@ -859,19 +860,43 @@ function isaacRecipeDecode(src, vorbis) {
     }
     return pre ? pr : pr.then(function (u) { wasRead(key); return u; });
   }
+  // Whole chunks are immutable (?v= names the content). Cache Storage keeps them on disk, outside
+  // the tab's memory: a chunk the RAM cache evicted, or one from an earlier visit, never crosses
+  // the network again.
+  var storeP = null;
+  function chunkStore() {
+    if (!storeP) {
+      storeP = typeof caches === 'undefined' ? Promise.resolve(null)
+        : caches.open('isaac-chunks-v1').then(function (c) {
+            var keep = Object.create(null);
+            for (var s = 0; s < S.length; s++) for (var i = 0; i < count(s); i++) keep[new URL(name(s, i), location.href).href] = 1;
+            c.keys().then(function (reqs) { reqs.forEach(function (q) { if (!keep[q.url]) c.delete(q).catch(function () {}); }); })
+              .catch(function () {});
+            return c;
+          }).catch(function () { return null; });
+    }
+    return storeP;
+  }
   async function piece1(s, i) {
-    var size = chunkLen(s, i), status, last = 5;
+    var size = chunkLen(s, i), status, last = 5, url = name(s, i), store = await chunkStore();
     for (var attempt = 0; attempt <= last; attempt++) {
       if (attempt) await new Promise(function (res) { setTimeout(res, attempt * 2000); });
-      var r, raw;
+      var r = null, raw, fromStore = false;
+      if (store) { try { r = await store.match(url); fromStore = !!r; } catch (e) { r = null; } }
       // A dropped mobile connection rejects fetch() or the body read; both retry like a bad status.
-      try { r = await fetch(name(s, i)); } catch (e) { if (attempt === last) throw e; continue; }
+      if (!r) { try { r = await fetch(url); } catch (e) { if (attempt === last) throw e; continue; } }
       if (r.ok) {
         if (!wholeHeader(r, size)) {
           await discard(r);
+          if (fromStore) { store.delete(url).catch(function () {}); continue; }
           throw new Error('piece ' + s + ':' + i + ': invalid whole response');
         }
-        try { raw = await body(r, s, i, 0, size); } catch (e) { if (attempt === last) throw e; continue; }
+        if (store && !fromStore) { try { store.put(url, r.clone()).catch(function () {}); } catch (e) {} }
+        try { raw = await body(r, s, i, 0, size); } catch (e) {
+          if (fromStore) { store.delete(url).catch(function () {}); continue; }
+          if (attempt === last) throw e;
+          continue;
+        }
         return remember(s + ':' + i, await unpackWhole(s, i, raw));
       }
       status = r.status; await discard(r);
@@ -1053,7 +1078,8 @@ function isaacRecipeDecode(src, vorbis) {
       var a = f.at + trail[j][1], b = a + trail[j][2] - 1;
       for (var i = Math.floor(a / S[f.s].size); i <= Math.floor(b / S[f.s].size); i++) add(f.s, i, true);
     }
-    for (var s = 0; s < S.length; s++) for (var i = 0; i < count(s); i++) add(s, i, false);
+    // A small cache evicts speculative whole chunks before they are read, and each comes back again.
+    if (PROFILE.rest) for (var s = 0; s < S.length; s++) for (var i = 0; i < count(s); i++) add(s, i, false);
     P.prefetch = { head: trailN, rest: jobs.length - trailN, of: jobs.length };
     // Observed inside fetchList; failed prefetches remain retryable by demands.
     fetchList(jobs, STREAM_WIDTH, true);
