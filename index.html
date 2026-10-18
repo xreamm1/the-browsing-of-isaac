@@ -4,6 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Isaac, recompiled</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Isaac">
+<meta name="theme-color" content="#000000">
+<script>
+  // The game is pixel art drawn into its own framebuffer: multisampling the page canvas only costs
+  // memory bandwidth (+10% fps measured headless without it), and phones should use the fast GPU path.
+  (function () {
+    var get = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+      if (this.id === 'canvas' && /^webgl/.test(type)) attrs = Object.assign({}, attrs, { antialias: false, powerPreference: 'high-performance' });
+      return get.call(this, type, attrs);
+    };
+  })();
+</script>
 <script>
 // Pick a loading profile for this device, and on phones reserve the game's ~465 MB heap
 // before anything else fragments a 32-bit address space.
@@ -230,7 +249,25 @@
   (function () {
     var btn = document.getElementById('fs-btn'), main = document.querySelector('main');
     var request = main.requestFullscreen || main.webkitRequestFullscreen;
-    if (!request || !matchMedia('(pointer: coarse)').matches) return;
+    if (!matchMedia('(pointer: coarse)').matches) return;
+    if (!request) {
+      // iPhone Safari has no element fullscreen: a page added to the Home Screen opens without the browser bars.
+      if (navigator.standalone || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches) return;
+      btn.hidden = false;
+      btn.addEventListener('click', function () {
+        var tip = document.getElementById('fs-tip');
+        if (!tip) {
+          tip = document.createElement('div'); tip.id = 'fs-tip'; tip.setAttribute('role', 'dialog');
+          tip.style.cssText = 'position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 56px);transform:translateX(-50%);z-index:30;max-width:min(90vw,360px);'
+            + 'padding:12px 14px;border:1px solid var(--edge);border-radius:8px;background:var(--panel);color:var(--ink);font:14px/1.4 system-ui,sans-serif;text-align:center';
+          tip.textContent = 'For fullscreen on iPhone: tap Share, then "Add to Home Screen", and start the game from that icon.';
+          tip.addEventListener('click', function () { tip.remove(); });
+          main.appendChild(tip);
+          setTimeout(function () { if (tip.parentNode) tip.remove(); }, 9000);
+        }
+      });
+      return;
+    }
     function sync() { btn.hidden = !!(document.fullscreenElement || document.webkitFullscreenElement); }
     btn.addEventListener('click', function () {
       Promise.resolve(request.call(main, { navigationUI: 'hide' })).then(function () {
