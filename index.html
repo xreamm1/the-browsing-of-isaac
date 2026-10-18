@@ -68,6 +68,9 @@
   #credit { position: fixed; right: calc(env(safe-area-inset-right) + 12px); bottom: calc(env(safe-area-inset-bottom) + 10px); z-index: 20;
     color: var(--dim); font: 20px/1.2 system-ui, sans-serif; letter-spacing: .02em; pointer-events: none; user-select: none; }
   #credit[hidden] { display: none; }
+  #net { position: fixed; left: calc(env(safe-area-inset-left) + 10px); bottom: calc(env(safe-area-inset-bottom) + 8px); z-index: 20;
+    color: var(--dim); font: 12px/1.2 system-ui, sans-serif; text-shadow: 1px 1px 0 #000; pointer-events: none; user-select: none; }
+  #net[hidden] { display: none; }
   #canvas { display: block; width: 100%; height: 100%; background: #000; outline: none; image-rendering: pixelated; image-rendering: crisp-edges; }
   /* Keep early presentations covered until native readiness, independently
      of the remaining background downloads. */
@@ -177,6 +180,7 @@
 <body>
 <main>
   <div id="credit">ported by xreamm</div>
+  <div id="net" hidden></div>
   <button id="fs-btn" type="button" aria-label="Fullscreen" title="Fullscreen" data-touch-ui hidden>&#x26F6;</button>
   <div id="stage">
     <canvas id="canvas" width="960" height="540" tabindex="0"></canvas>
@@ -276,6 +280,18 @@
       }
     })();
     function sync() { credit.hidden = overlay.hidden; }
+    // While the game runs, say when it is waiting on downloaded data rather than frozen.
+    var net = document.getElementById('net'), since = 0;
+    setInterval(function () {
+      var P = window.isaacPortable, text = '';
+      if (P && P.busy && overlay.hidden) {
+        var busy = P.busy(), st = P.stored();
+        since = busy ? (since || Date.now()) : 0;
+        if (busy && Date.now() - since > 1000) text = 'Loading game data...';
+        else if (st.active) text = 'Saving game data: ' + st.done + ' / ' + st.of;
+      }
+      net.textContent = text; net.hidden = !text;
+    }, 500);
     new MutationObserver(sync).observe(overlay, { attributes: true, attributeFilter: ['hidden'] });
     sync();
   })();
@@ -868,6 +884,8 @@ function isaacRecipeDecode(src, vorbis) {
     if (!storeP) {
       storeP = typeof caches === 'undefined' ? Promise.resolve(null)
         : caches.open('isaac-chunks-v1').then(function (c) {
+            // Ask that ~1 GB of chunks not be evicted under storage pressure; Chrome decides silently.
+            try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {}); } catch (e) {}
             var keep = Object.create(null);
             for (var s = 0; s < S.length; s++) for (var i = 0; i < count(s); i++) keep[new URL(name(s, i), location.href).href] = 1;
             c.keys().then(function (reqs) { reqs.forEach(function (q) { if (!keep[q.url]) c.delete(q).catch(function () {}); }); })
@@ -1110,7 +1128,38 @@ function isaacRecipeDecode(src, vorbis) {
       freed += cache.get(keys[k]).length;
       forget(keys[k]);
     }
+    if (!PROFILE.rest && !storing) { storing = true; storeRest(); }
     return { kept: n, freed: freed };
+  }
+  // Phones do not prefetch the payload into memory. Once the boot is done they copy the
+  // remaining chunks straight to Cache Storage, one at a time and only while the game is not
+  // waiting on a read, so a run's first rooms come off disk instead of the network.
+  var storing = false, storedN = 0, storeTotal = 0, storeAt = '', storeErr = '';
+  async function storeRest() {
+    var store = await chunkStore();
+    if (!store) return;
+    var jobs = [];
+    for (var s = 0; s < S.length; s++) if (!S[s].gz) for (var i = 0; i < count(s); i++) jobs.push([s, i]);
+    storeTotal = jobs.length;
+    for (var j = 0; j < jobs.length; j++) {
+      var url = name(jobs[j][0], jobs[j][1]);
+      storeAt = jobs[j][0] + ':' + jobs[j][1];
+      try { if (await store.match(url)) { storedN++; continue; } } catch (e) { storeErr = String(e && e.message || e); return; }
+      while (flight.size) await new Promise(function (res) { setTimeout(res, 500); });
+      // A stalled connection never settles on its own; abort it and try that chunk again.
+      var ac = typeof AbortController === 'function' ? new AbortController() : null;
+      var timer = ac ? setTimeout(function () { ac.abort(); }, 90000) : 0;
+      try {
+        var r = await fetch(url, ac ? { signal: ac.signal } : undefined);
+        if (r.ok && wholeHeader(r, chunkLen(jobs[j][0], jobs[j][1]))) { await store.put(url, r); storedN++; }
+        else { storeErr = 'HTTP ' + r.status; await discard(r); }
+      } catch (e) {
+        storeErr = String(e && e.message || e);
+        if (e && e.name === 'QuotaExceededError') { storing = false; return; }
+        j--; await new Promise(function (res) { setTimeout(res, 5000); });
+      }
+      finally { clearTimeout(timer); }
+    }
   }
   function keptBytes(rel, off, len) {
     var u = kept[rel];
@@ -1137,6 +1186,9 @@ function isaacRecipeDecode(src, vorbis) {
     })(),
     ranges: function () { return ranges; },
     prefetch: function () { return P.prefetch || null; },
+    busy: function () { return flight.size; },
+    stored: function () { return { done: storedN, of: storeTotal, active: storing && storedN < storeTotal, at: storeAt, error: storeErr }; },
+    storing: function () { return storing; },
     key: KEY,
     chunks: chunks,
     rangesWhy: function () { return P.rangesWhy || null; },
