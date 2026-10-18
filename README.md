@@ -76,8 +76,10 @@ asks first.
 
 ## Browsers
 
-Chrome, Edge and other Chromium browsers, on desktop or Android. If your browser
-can't run it, the page says so.
+Firefox 153 or newer, Chrome and Edge 137 or newer (desktop or Android), and
+Safari on a current iPhone. On Huawei phones, install Firefox from AppGallery:
+the built-in Huawei Browser is usually too old. If your browser can't run it,
+the page says so and names what to install.
 
 ## Building it yourself
 
