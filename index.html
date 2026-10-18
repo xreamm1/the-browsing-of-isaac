@@ -15,6 +15,8 @@
   // The heap reaches ~673 MiB (10767 pages) in the menu, so the maximum stays above that while possible.
   var tries = [[7680, 16384], [7680, 12288], [7680, 11264], [7552, 9216], [7440, 7440]];
   if (is64) tries.unshift([7680, 65536]);
+  // The chunk loader keeps far fewer whole 27 MB chunks in flight and cached in a 32-bit renderer.
+  window.__isaacLowMem = !is64;
   for (var i = 0; i < tries.length; i++) {
     try {
       window.__isaacMemory = new WebAssembly.Memory({ initial: tries[i][0], maximum: tries[i][1] });
@@ -501,7 +503,8 @@ function isaacRecipeDecode(src, vorbis) {
 
 (function () {
   var P = window.__isaacPortableData, S = P.streams;
-  var WIN = 1048576, CACHE_MAX = 256 * WIN, AHEAD = 8, STREAM_WIDTH = 6;
+  var LOW = !!window.__isaacLowMem;
+  var WIN = 1048576, CACHE_MAX = (LOW ? 96 : 256) * WIN, AHEAD = LOW ? 2 : 8, STREAM_WIDTH = LOW ? 2 : 6;
   // Whole-read chunks are unwrapped once. Windowed chunks keep their stored,
   // scrambled bytes: only a demanded window is copied, unscrambled and inflated.
   var cache = new Map(), cacheBytes = 0, flight = new Map();
@@ -836,7 +839,7 @@ function isaacRecipeDecode(src, vorbis) {
       }
     }
     var crew = [];
-    for (var w = 0; w < Math.min(6, parts.length); w++) crew.push(worker());
+    for (var w = 0; w < Math.min(STREAM_WIDTH, parts.length); w++) crew.push(worker());
     await Promise.all(crew);
     return out;
   }
