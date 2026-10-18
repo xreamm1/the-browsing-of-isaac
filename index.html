@@ -67,6 +67,11 @@
   #credit { position: fixed; right: calc(env(safe-area-inset-right) + 12px); bottom: calc(env(safe-area-inset-bottom) + 10px); z-index: 20;
     color: var(--dim); font: 12px/1.2 system-ui, sans-serif; letter-spacing: .02em; pointer-events: none; user-select: none; }
   #credit[hidden] { display: none; }
+  #mods-toggle { position: fixed; top: calc(env(safe-area-inset-top) + 10px); right: calc(env(safe-area-inset-right) + 12px); z-index: 20;
+    min-height: 36px; padding: 6px 12px; border: 1px solid var(--edge); border-radius: 6px; background: var(--panel); color: var(--ink);
+    font: 13px/1.2 system-ui, sans-serif; cursor: pointer; }
+  #mods-toggle:hover { border-color: var(--accent); }
+  #mods-toggle[hidden] { display: none; }
   #canvas { display: block; width: 100%; height: 100%; background: #000; outline: none; image-rendering: pixelated; image-rendering: crisp-edges; }
   /* Keep early presentations covered until native readiness, independently
      of the remaining background downloads. */
@@ -176,6 +181,7 @@
 <body>
 <main>
   <div id="credit">ported by xreamm</div>
+  <button id="mods-toggle" type="button" data-touch-ui hidden></button>
   <button id="fs-btn" type="button" aria-label="Fullscreen" title="Fullscreen" data-touch-ui hidden>&#x26F6;</button>
   <div id="stage">
     <canvas id="canvas" width="960" height="540" tabindex="0"></canvas>
@@ -232,8 +238,61 @@
   (function () {
     // The credit belongs to the loading screen; the game itself keeps the whole picture.
     var credit = document.getElementById('credit'), overlay = document.getElementById('overlay');
-    function sync() { credit.hidden = overlay.hidden; }
+    var toggle = document.getElementById('mods-toggle'), url = new URL(location.href);
+    var off = url.searchParams.get('mods') === '0';
+    // Reloads with or without ?mods=0, so a mod that stops the game can be removed from a clean boot.
+    toggle.textContent = off ? 'Enable mods' : 'Disable mods';
+    toggle.title = off ? 'Reload with installed mods' : 'Reload without installed mods';
+    toggle.addEventListener('click', function () {
+      if (off) url.searchParams.delete('mods'); else url.searchParams.set('mods', '0');
+      location.replace(url.href);
+    });
+    var error = document.getElementById('error');
+    // Draw the credit in the game's own TeamMeat font once the payload can hand it over.
+    (async function drawCredit() {
+      for (var tries = 0; tries < 240; tries++) {
+        var P = window.isaacPortable;
+        if (P && P.bytesFor) {
+          try {
+            var fb = await P.bytesFor('page-assets/teammeatfont16.fnt', 0, 0);
+            var img = await createImageBitmap(new Blob([await P.bytesFor('page-assets/teammeatfont16_0.png', 0, 0)], { type: 'image/png' }));
+            var dv = new DataView(fb.buffer, fb.byteOffset, fb.byteLength), glyphs = {};
+            // Binary BMFont v3: blocks of [type u8, size u32]; block 4 holds 20-byte char records.
+            for (var i = 4; i < fb.length;) {
+              var type = fb[i], size = dv.getUint32(i + 1, true);
+              if (type === 4) for (var j = i + 5; j + 20 <= i + 5 + size; j += 20) {
+                glyphs[dv.getUint32(j, true)] = { x: dv.getUint16(j + 4, true), y: dv.getUint16(j + 6, true), w: dv.getUint16(j + 8, true),
+                  h: dv.getUint16(j + 10, true), ox: dv.getInt16(j + 12, true), oy: dv.getInt16(j + 14, true), adv: dv.getInt16(j + 16, true) };
+              }
+              i += 5 + size;
+            }
+            var text = 'ported by xreamm', width = 0, height = 0;
+            for (var k = 0; k < text.length; k++) {
+              var gl = glyphs[text.charCodeAt(k)];
+              if (gl) { width += gl.adv; height = Math.max(height, gl.oy + gl.h); } else width += 6;
+            }
+            var canvas = document.createElement('canvas');
+            canvas.width = width + 2; canvas.height = height + 2;
+            var g = canvas.getContext('2d'), x = 1;
+            for (var k2 = 0; k2 < text.length; k2++) {
+              var gl2 = glyphs[text.charCodeAt(k2)];
+              if (!gl2) { x += 6; continue; }
+              g.drawImage(img, gl2.x, gl2.y, gl2.w, gl2.h, x + gl2.ox, 1 + gl2.oy, gl2.w, gl2.h);
+              x += gl2.adv;
+            }
+            canvas.setAttribute('aria-label', 'ported by xreamm');
+            canvas.style.cssText = 'display:block;width:' + canvas.width + 'px;height:' + canvas.height + 'px;image-rendering:pixelated;filter:drop-shadow(1px 1px 0 rgba(0,0,0,.85))';
+            credit.textContent = '';
+            credit.appendChild(canvas);
+            return;
+          } catch (e) { /* the page-assets chunk is not in yet */ }
+        }
+        await new Promise(function (res) { setTimeout(res, 500); });
+      }
+    })();
+    function sync() { credit.hidden = overlay.hidden; toggle.hidden = overlay.hidden && error.hidden; }
     new MutationObserver(sync).observe(overlay, { attributes: true, attributeFilter: ['hidden'] });
+    new MutationObserver(sync).observe(error, { attributes: true, attributeFilter: ['hidden'] });
     sync();
   })();
 </script>
