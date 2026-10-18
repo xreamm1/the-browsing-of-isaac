@@ -18,7 +18,7 @@
   (function () {
     var get = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = function (type, attrs) {
-      if (this.id === 'canvas' && /^webgl/.test(type)) attrs = Object.assign({}, attrs, { antialias: false, powerPreference: 'high-performance' });
+      if (this.id === 'canvas' && /^webgl/.test(type)) { attrs = Object.assign({}, attrs, { antialias: false, powerPreference: 'high-performance' }); var q = new URLSearchParams(location.search); if (q.get('gla') === '0') attrs.alpha = false; if (q.get('gld') === '0') attrs.depth = false; if (q.get('gldes') === '1') attrs.desynchronized = true; }
       return get.call(this, type, attrs);
     };
   })();
