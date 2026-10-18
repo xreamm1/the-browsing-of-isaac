@@ -396,13 +396,26 @@ export function createTouchControls({ readState, emit, onGesture, guest, assetsU
     const key = `${mode}:${shown}:${art.ready}:${twin}:${pointersHold('pause')}:${pointersHold('twin')}:${hudBox.pause.x}:${hudBox.pause.y}`;
     if (key === hudKey) return;
     hudKey = key;
+    // The canvas covers only the marks, not the whole picture: a full-screen
+    // transparent layer costs the compositor a blend of every pixel every frame
+    // (15% of the frame rate on a GPU-bound phone), and an empty one is hidden.
+    hud.hidden = !shown || !art.ready;
+    if (hud.hidden) return;
+    const { pause: p, twin: t } = hudBox;
+    const bx = Math.max(0, Math.floor(Math.min(p.x, t.x)) - 4), by = Math.max(0, Math.floor(Math.min(p.y, t.y)) - 4);
+    const bw = Math.min(GAME_W, Math.ceil(Math.max(p.x + p.w, t.x + t.w)) + 4) - bx;
+    const bh = Math.min(GAME_H, Math.ceil(Math.max(p.y + p.h, t.y + t.h)) + 4) - by;
+    if (hud.width !== bw * 2 || hud.height !== bh * 2) {
+      hud.width = bw * 2; hud.height = bh * 2;
+      hudCtx.imageSmoothingEnabled = false;
+    }
+    Object.assign(hud.style, { left: `${bx / GAME_W * 100}%`, top: `${by / GAME_H * 100}%`, width: `${bw / GAME_W * 100}%`, height: `${bh / GAME_H * 100}%` });
     hudCtx.clearRect(0, 0, hud.width, hud.height);
-    if (!shown || !art.ready) return;
     const draw = (name, at) => {
       const cell = art.hud.marks[name];
       if (!cell) return;
       const [sx, sy, sw, sh] = cell, down = pointersHold(name) ? 2 : 0;
-      hudCtx.drawImage(art.img.marks, sx, sy, sw, sh, Math.round(at.x * 2), Math.round(at.y * 2) + down, sw, sh);
+      hudCtx.drawImage(art.img.marks, sx, sy, sw, sh, Math.round(at.x * 2) - bx * 2, Math.round(at.y * 2) - by * 2 + down, sw, sh);
     };
     draw('pause', hudBox.pause);
     if (twin) draw('twin', hudBox.twin);
