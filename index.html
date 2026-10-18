@@ -753,19 +753,22 @@ function isaacRecipeDecode(src, vorbis) {
     return pre ? pr : pr.then(function (u) { wasRead(key); return u; });
   }
   async function piece1(s, i) {
-    var size = chunkLen(s, i), status;
-    for (var attempt = 0; attempt < 4; attempt++) {
+    var size = chunkLen(s, i), status, last = 5;
+    for (var attempt = 0; attempt <= last; attempt++) {
       if (attempt) await new Promise(function (res) { setTimeout(res, attempt * 2000); });
-      var r = await fetch(name(s, i));
+      var r, raw;
+      // A dropped mobile connection rejects fetch() or the body read; both retry like a bad status.
+      try { r = await fetch(name(s, i)); } catch (e) { if (attempt === last) throw e; continue; }
       if (r.ok) {
         if (!wholeHeader(r, size)) {
           await discard(r);
           throw new Error('piece ' + s + ':' + i + ': invalid whole response');
         }
-        return remember(s + ':' + i, await unpackWhole(s, i, await body(r, s, i, 0, size)));
+        try { raw = await body(r, s, i, 0, size); } catch (e) { if (attempt === last) throw e; continue; }
+        return remember(s + ':' + i, await unpackWhole(s, i, raw));
       }
       status = r.status; await discard(r);
-      if (status === 410 || attempt === 3) throw new Error('piece ' + s + ':' + i + ': HTTP ' + status);
+      if (status === 410 || attempt === last) throw new Error('piece ' + s + ':' + i + ': HTTP ' + status);
     }
   }
   function inWindow(p) {
@@ -790,7 +793,9 @@ function isaacRecipeDecode(src, vorbis) {
     var key = p.s + ':' + p.i;
     if (!ranges || cache.has(key) || flight.has(key)) return slicePiece(p, await piece(p.s, p.i));
     var w = inWindow(p), cut = w || { from: p.within, to: p.within + p.take - 1 };
-    var r = await fetch(name(p.s, p.i, cut), { headers: { Range: 'bytes=' + cut.from + '-' + cut.to } });
+    var r;
+    try { r = await fetch(name(p.s, p.i, cut), { headers: { Range: 'bytes=' + cut.from + '-' + cut.to } }); }
+    catch (e) { return slicePiece(p, await piece(p.s, p.i)); }
     if (!r.ok) {
       await discard(r);
       throw new Error('range ' + key + ': HTTP ' + r.status);
