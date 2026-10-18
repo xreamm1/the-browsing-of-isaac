@@ -19,7 +19,7 @@
   var PROFILES = {
     fast: { label: 'Fast', cacheMB: 256, width: 6, ahead: 8 },
     optimized: { label: 'Optimized', cacheMB: 160, width: 3, ahead: 4 },
-    economy: { label: 'Economy', cacheMB: 96, width: 2, ahead: 2 }
+    economy: { label: 'Economy', cacheMB: 64, width: 2, ahead: 2 }
   };
   var id = !is64 ? 'economy' : (mobile || (ram && ram <= 4)) ? 'optimized' : 'fast';
   var forced = new URLSearchParams(location.search).get('profile');
@@ -31,7 +31,9 @@
       + ' · ' + (is64 ? '64' : '32') + '-bit browser' };
   if (!mobile || typeof WebAssembly === 'undefined') return;
   // The heap reaches ~673 MiB (10767 pages) in the menu, so the maximum stays above that while possible.
-  var tries = [[7680, 16384], [7680, 12288], [7680, 11264], [7552, 9216], [7440, 7440]];
+  // A 32-bit renderer's address space is the limit: every MiB reserved past the heap's need
+  // is a MiB the compiled code and the page's buffers cannot have.
+  var tries = [[7680, 12288], [7680, 11264], [7552, 9216], [7440, 7440]];
   if (is64) tries.unshift([7680, 65536]);
   for (var i = 0; i < tries.length; i++) {
     try {
@@ -62,6 +64,9 @@
     width: 44px; height: 44px; padding: 0; border: 1px solid rgba(233, 223, 207, .35); border-radius: 8px;
     background: rgba(20, 17, 15, .6); color: #e9dfcf; font: 22px/1 system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
   #fs-btn[hidden] { display: none; }
+  #credit { position: fixed; right: calc(env(safe-area-inset-right) + 12px); bottom: calc(env(safe-area-inset-bottom) + 10px); z-index: 20;
+    color: var(--dim); font: 12px/1.2 system-ui, sans-serif; letter-spacing: .02em; pointer-events: none; user-select: none; }
+  #credit[hidden] { display: none; }
   #canvas { display: block; width: 100%; height: 100%; background: #000; outline: none; image-rendering: pixelated; image-rendering: crisp-edges; }
   /* Keep early presentations covered until native readiness, independently
      of the remaining background downloads. */
@@ -170,6 +175,7 @@
 </head>
 <body>
 <main>
+  <div id="credit">ported by xreamm</div>
   <button id="fs-btn" type="button" aria-label="Fullscreen" title="Fullscreen" data-touch-ui hidden>&#x26F6;</button>
   <div id="stage">
     <canvas id="canvas" width="960" height="540" tabindex="0"></canvas>
@@ -221,6 +227,13 @@
     });
     document.addEventListener('fullscreenchange', sync);
     document.addEventListener('webkitfullscreenchange', sync);
+    sync();
+  })();
+  (function () {
+    // The credit belongs to the loading screen; the game itself keeps the whole picture.
+    var credit = document.getElementById('credit'), overlay = document.getElementById('overlay');
+    function sync() { credit.hidden = overlay.hidden; }
+    new MutationObserver(sync).observe(overlay, { attributes: true, attributeFilter: ['hidden'] });
     sync();
   })();
 </script>
