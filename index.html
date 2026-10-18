@@ -249,32 +249,35 @@
   (function () {
     var btn = document.getElementById('fs-btn'), main = document.querySelector('main');
     var request = main.requestFullscreen || main.webkitRequestFullscreen;
-    if (!matchMedia('(pointer: coarse)').matches) return;
-    if (!request) {
-      // iPhone Safari has no element fullscreen: a page added to the Home Screen opens without the browser bars.
-      if (navigator.standalone || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches) return;
-      btn.hidden = false;
-      btn.addEventListener('click', function () {
-        var tip = document.getElementById('fs-tip');
-        if (!tip) {
-          tip = document.createElement('div'); tip.id = 'fs-tip'; tip.setAttribute('role', 'dialog');
-          tip.style.cssText = 'position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 56px);transform:translateX(-50%);z-index:30;max-width:min(90vw,360px);'
-            + 'padding:12px 14px;border:1px solid var(--edge);border-radius:8px;background:var(--panel);color:var(--ink);font:14px/1.4 system-ui,sans-serif;text-align:center';
-          tip.textContent = 'For fullscreen on iPhone: tap Share, then "Add to Home Screen", and start the game from that icon.';
-          tip.addEventListener('click', function () { tip.remove(); });
-          main.appendChild(tip);
-          setTimeout(function () { if (tip.parentNode) tip.remove(); }, 9000);
-        }
-      });
-      return;
+    var touch = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
+    if (!touch) return;
+    function isFull() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+    // Launched from the Home Screen: already without browser bars.
+    if (navigator.standalone || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches) return;
+    function tip() {
+      // iPhone Safari has no element fullscreen (or claims it and does nothing): a page added to
+      // the Home Screen opens without the browser bars.
+      var el = document.getElementById('fs-tip');
+      if (el) return;
+      el = document.createElement('div'); el.id = 'fs-tip'; el.setAttribute('role', 'dialog');
+      el.style.cssText = 'position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 56px);transform:translateX(-50%);z-index:30;max-width:min(90vw,360px);'
+        + 'padding:12px 14px;border:1px solid var(--edge);border-radius:8px;background:var(--panel);color:var(--ink);font:14px/1.4 system-ui,sans-serif;text-align:center';
+      el.textContent = 'For fullscreen on iPhone: tap Share, then "Add to Home Screen", and start the game from that icon.';
+      el.addEventListener('click', function () { el.remove(); });
+      main.appendChild(el);
+      setTimeout(function () { if (el.parentNode) el.remove(); }, 9000);
     }
-    function sync() { btn.hidden = !!(document.fullscreenElement || document.webkitFullscreenElement); }
+    function sync() { btn.hidden = isFull(); }
     btn.addEventListener('click', function () {
-      Promise.resolve(request.call(main, { navigationUI: 'hide' })).then(function () {
+      if (!request) { tip(); return; }
+      var p;
+      try { p = request.call(main, { navigationUI: 'hide' }); } catch (e) { tip(); return; }
+      Promise.resolve(p).then(function () {
         try { screen.orientation.lock('landscape').catch(function () {}); } catch (e) {}
         var canvas = document.getElementById('canvas');
         if (canvas) canvas.focus();
-      }).catch(function () {});
+      }).catch(function () { tip(); });
+      setTimeout(function () { if (!isFull()) tip(); }, 600);
     });
     document.addEventListener('fullscreenchange', sync);
     document.addEventListener('webkitfullscreenchange', sync);
