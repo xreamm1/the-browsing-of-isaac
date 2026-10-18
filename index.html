@@ -20,7 +20,7 @@
     // rest: also prefetch the chunks the boot trail does not name (the whole ~1 GB payload).
     fast: { label: 'Fast', cacheMB: 256, width: 6, ahead: 8, rest: true },
     optimized: { label: 'Optimized', cacheMB: 160, width: 3, ahead: 4, rest: false },
-    economy: { label: 'Economy', cacheMB: 96, width: 2, ahead: 2, rest: false }
+    economy: { label: 'Economy', cacheMB: 32, width: 2, ahead: 2, rest: false }
   };
   var id = !is64 ? 'economy' : (mobile || (ram && ram <= 4)) ? 'optimized' : 'fast';
   var forced = new URLSearchParams(location.search).get('profile');
