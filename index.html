@@ -15,10 +15,23 @@
 <script>
   // The game is pixel art drawn into its own framebuffer: multisampling the page canvas only costs
   // memory bandwidth (+10% fps measured headless without it), and phones should use the fast GPU path.
+  // Canvas switches (gla=0 opaque, gld=0 no depth, gldes=1 desynchronized) come from the URL, or
+  // from the benchmark's saved choice (localStorage isaac-gl) except while the benchmark runs.
   (function () {
+    var q = new URLSearchParams(location.search), b = q.get('bench'), saved = '';
+    window.__isaacBench = b === 'run' ? 'run' : q.has('bench') ? 'menu' : '';
+    if (window.__isaacBench === 'menu') window.__isaacHold = true;
+    if (b !== 'run') { try { saved = localStorage.getItem('isaac-gl') || ''; } catch (e) {} }
+    var s = new URLSearchParams(saved);
+    function opt(k) { return q.has(k) ? q.get(k) : s.get(k); }
     var get = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = function (type, attrs) {
-      if (this.id === 'canvas' && /^webgl/.test(type)) { attrs = Object.assign({}, attrs, { antialias: false, powerPreference: 'high-performance' }); var q = new URLSearchParams(location.search); if (q.get('gla') === '0') attrs.alpha = false; if (q.get('gld') === '0') attrs.depth = false; if (q.get('gldes') === '1') attrs.desynchronized = true; }
+      if (this.id === 'canvas' && /^webgl/.test(type)) {
+        attrs = Object.assign({}, attrs, { antialias: false, powerPreference: 'high-performance' });
+        if (opt('gla') === '0') attrs.alpha = false;
+        if (opt('gld') === '0') attrs.depth = false;
+        if (opt('gldes') === '1') attrs.desynchronized = true;
+      }
       return get.call(this, type, attrs);
     };
   })();
@@ -375,6 +388,176 @@
     }, 1000);
     new MutationObserver(sync).observe(overlay, { attributes: true, attributeFilter: ['hidden'] });
     sync();
+  })();
+</script>
+<script>
+  // Benchmark (?bench): which canvas settings give this device more frames. A context's attributes
+  // are fixed when it is created, so every setting gets its own page load; the queue and the results
+  // live in localStorage between loads. Saves stay off during the runs (persist=0).
+  (function () {
+    var mode = window.__isaacBench;
+    if (!mode) return;
+    var KEY = 'isaac-bench', WARM = 8000, MEASURE = 30000, START_TIMEOUT = 180000;
+    var VARIANTS = [
+      { id: 'base', name: 'Default', q: '' },
+      { id: 'gla0', name: 'Opaque canvas', q: 'gla=0' },
+      { id: 'gld0', name: 'No depth buffer', q: 'gld=0' },
+      { id: 'both', name: 'Opaque + no depth', q: 'gla=0&gld=0' },
+      { id: 'des', name: 'Low-latency canvas', q: 'gldes=1' },
+      { id: 'base2', name: 'Default again (heat check)', q: '' }
+    ];
+    function load() { try { return JSON.parse(localStorage.getItem(KEY)) || null; } catch (e) { return null; } }
+    function store(st) { try { localStorage.setItem(KEY, JSON.stringify(st)); } catch (e) {} }
+    function applied() { try { return localStorage.getItem('isaac-gl') || ''; } catch (e) { return ''; } }
+    function runUrl(i) { var v = VARIANTS[i]; return location.pathname + '?bench=run&i=' + i + '&persist=0&autoplay=1' + (v.q ? '&' + v.q : ''); }
+    var css = document.createElement('style');
+    css.textContent =
+      '#bench{position:fixed;z-index:60;left:50%;transform:translateX(-50%);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#eee3da}' +
+      '#bench.banner{top:calc(env(safe-area-inset-top,0px) + 6px);background:rgba(0,0,0,.72);padding:6px 12px;border-radius:6px;pointer-events:none;white-space:nowrap;font-size:12px}' +
+      '#bench.panel{top:0;bottom:0;left:0;right:0;transform:none;overflow:auto;background:#17110f;padding:24px max(16px,env(safe-area-inset-right,0px)) 32px max(16px,env(safe-area-inset-left,0px));box-sizing:border-box}' +
+      '#bench .in{max-width:760px;margin:0 auto}' +
+      '#bench h2{margin:0 0 6px;font-size:22px}#bench p{margin:6px 0;color:#c9b8ab}' +
+      '#bench table{border-collapse:collapse;width:100%;margin:14px 0;font-variant-numeric:tabular-nums}' +
+      '#bench th,#bench td{text-align:left;padding:7px 8px;border-bottom:1px solid #3a2d27}#bench th{color:#a8968a;font-weight:500;font-size:12px}' +
+      '#bench .good{color:#7fbf6a}#bench .bad{color:#d26a5c}#bench .dim{color:#8b7b70}' +
+      '#bench button,#bench a.btn{font:inherit;background:#d9a441;color:#17110f;border:0;border-radius:6px;padding:9px 14px;margin:6px 8px 0 0;cursor:pointer;text-decoration:none;display:inline-block}' +
+      '#bench button.alt,#bench a.btn.alt{background:#3a2d27;color:#eee3da}#bench pre{white-space:pre-wrap;font-size:11px;color:#a8968a}';
+    document.head.appendChild(css);
+    var box = document.createElement('div'); box.id = 'bench'; document.body.appendChild(box);
+    if (mode === 'menu') menu(); else run();
+
+    function device() {
+      var r = '';
+      try { var gl = document.createElement('canvas').getContext('webgl'), ext = gl && gl.getExtension('WEBGL_debug_renderer_info'); r = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : ''; } catch (e) {}
+      return { ua: navigator.userAgent, gpu: r, cores: navigator.hardwareConcurrency || 0, memory: navigator.deviceMemory || 0,
+        screen: screen.width + 'x' + screen.height + ' @' + (window.devicePixelRatio || 1) };
+    }
+    function refreshRate(done) {
+      var t = [], n = 0;
+      (function f(now) { t.push(now); if (++n < 61) requestAnimationFrame(f); else {
+        var d = []; for (var i = 1; i < t.length; i++) d.push(t[i] - t[i - 1]);
+        d.sort(function (a, b) { return a - b; }); done(Math.round(1000 / d[d.length >> 1]));
+      } })(performance.now());
+    }
+
+    function menu() {
+      box.className = 'panel';
+      var st = load(), html = '<h2>Frame-rate test</h2>';
+      if (st && st.results && st.results.length === VARIANTS.length) html += report(st);
+      else {
+        html += '<p>The game starts ' + VARIANTS.length + ' times, each time with a different canvas setting, and plays itself for 30 seconds. ' +
+          'At the end you get a table of which setting gives this device the most frames, and can turn the best one on.</p>' +
+          '<p>Takes about 6–8 minutes. Hold the phone sideways, keep the screen on and don’t touch it. Your saves are not touched.</p>' +
+          (st && st.results && st.results.length ? '<p class="dim">An earlier test stopped after ' + st.results.length + ' of ' + VARIANTS.length + '.</p>' : '') +
+          '<button id="bench-go">Start the test</button><a class="btn alt" href="./">Back to the game</a>' +
+          '<p class="dim">Current setting: ' + (applied() || 'default') + '</p>';
+      }
+      box.innerHTML = '<div class="in">' + html + '</div>';
+      var go = document.getElementById('bench-go');
+      if (go) go.onclick = function () {
+        refreshRate(function (hz) { store({ i: 0, results: [], device: device(), hz: hz, at: Date.now() }); location.href = runUrl(0); });
+      };
+      wire(st);
+    }
+
+    function report(st) {
+      var R = st.results, base = R.filter(function (r) { return /^base/.test(r.id) && r.fps; });
+      var ref = base.length ? base.reduce(function (a, r) { return a + r.fps; }, 0) / base.length : 0;
+      var noise = base.length === 2 && ref ? Math.abs(base[0].fps - base[1].fps) / ref : 0;
+      var bar = Math.max(0.05, noise * 1.5), best = null;
+      var rows = R.map(function (r) {
+        if (!r.fps) return '<tr><td>' + r.name + '</td><td colspan="5" class="bad">' + (r.error || 'failed') + '</td></tr>';
+        var d = ref ? r.fps / ref - 1 : 0, cls = '';
+        if (!/^base/.test(r.id) && ref) {
+          if (d > bar) { cls = 'good'; if (!best || r.fps > best.fps) best = r; }
+          else if (d < -bar) cls = 'bad';
+        }
+        return '<tr><td>' + r.name + '</td><td>' + r.fps.toFixed(1) + '</td><td>' + r.low1.toFixed(1) + '</td><td>' + r.p95.toFixed(0) +
+          '</td><td>' + Math.round(r.tps / 30 * 100) + '%</td><td class="' + cls + '">' + (/^base/.test(r.id) ? '—' : (d >= 0 ? '+' : '') + (d * 100).toFixed(0) + '%') + '</td></tr>';
+      }).join('');
+      var dev = st.device || {};
+      var verdict = best
+        ? '<p class="good">Best on this device: <b>' + best.name + '</b> (+' + ((best.fps / ref - 1) * 100).toFixed(0) + '% frames).</p><button id="bench-apply" data-q="' + VARIANTS.filter(function (v) { return v.id === best.id; })[0].q + '">Turn it on</button>'
+        : '<p>No setting beat the default by more than the difference between the two default runs (' + (bar * 100).toFixed(0) + '%). The default is already the best choice here.</p>';
+      return '<p class="dim">' + (dev.gpu || 'GPU unknown') + ' · ' + dev.cores + ' cores' + (dev.memory ? ' · ' + dev.memory + ' GB' : '') + ' · screen ' + (st.hz || '?') + ' Hz</p>' +
+        '<table><thead><tr><th>Setting</th><th>FPS</th><th>1% low</th><th>p95 ms</th><th>Game speed</th><th>vs default</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+        '<p class="dim">Game speed 100% = 30 game ticks a second, the speed of the PC game. If it is under 100%, the device is too slow for full speed whatever the frame rate.' +
+        (noise ? ' The two default runs differ by ' + (noise * 100).toFixed(0) + '%: smaller differences are noise.' : '') + '</p>' +
+        verdict + '<button id="bench-reset" class="alt">Back to default</button><button id="bench-copy" class="alt">Copy results</button>' +
+        '<button id="bench-again" class="alt">Run again</button><a class="btn alt" href="./">Back to the game</a>' +
+        '<p class="dim">Current setting: ' + (applied() || 'default') + '</p><pre id="bench-raw" hidden></pre>';
+    }
+
+    function wire(st) {
+      function on(id, f) { var el = document.getElementById(id); if (el) el.onclick = f; }
+      on('bench-apply', function () { try { localStorage.setItem('isaac-gl', this.getAttribute('data-q')); } catch (e) {} menu(); });
+      on('bench-reset', function () { try { localStorage.removeItem('isaac-gl'); } catch (e) {} menu(); });
+      on('bench-again', function () { try { localStorage.removeItem(KEY); } catch (e) {} menu(); });
+      on('bench-copy', function () {
+        var text = JSON.stringify(st, null, 1), raw = document.getElementById('bench-raw'), btn = this;
+        raw.textContent = text; raw.hidden = false;
+        try { navigator.clipboard.writeText(text).then(function () { btn.textContent = 'Copied'; }, function () {}); } catch (e) {}
+      });
+    }
+
+    function run() {
+      box.className = 'banner';
+      var st = load(), i = +new URLSearchParams(location.search).get('i');
+      if (!st || st.i !== i || !VARIANTS[i]) { box.textContent = 'Test state lost — open ?bench to start again'; return; }
+      var v = VARIANTS[i], label = 'Test ' + (i + 1) + '/' + VARIANTS.length + ': ' + v.name;
+      function say(t) { box.textContent = label + ' — ' + t; }
+      function ticks() {
+        var G = window.isaacGuest; if (!G) return -1;
+        try { var game = G.u32(0x00c71678); return game ? G.u32(game + 0x264f8) : -1; } catch (e) { return -1; }
+      }
+      function key(name, down) { if (typeof window.isaacInjectKey === 'function') window.isaacInjectKey(name, down); }
+      function finish(result) {
+        result.id = v.id; result.name = v.name;
+        result.orientation = innerWidth > innerHeight ? 'landscape' : 'portrait';
+        st.results.push(result); st.i = i + 1; store(st);
+        location.href = st.i < VARIANTS.length ? runUrl(st.i) : location.pathname + '?bench=1';
+      }
+      var t0 = Date.now(), last = -1, rising = 0, pressAt = 0;
+      say('loading… hold the phone sideways, don’t touch the screen');
+      var wait = setInterval(function () {
+        if (Date.now() - t0 > START_TIMEOUT) { clearInterval(wait); finish({ error: 'the run did not start' }); return; }
+        if ((window.isaacFrame || 0) < 60) return;
+        var t = ticks();
+        rising = t > 0 && last >= 0 && t > last ? rising + 1 : 0;
+        last = t;
+        if (rising >= 2) { clearInterval(wait); play(); return; }
+        if (Date.now() - pressAt > 2500) {
+          pressAt = Date.now(); say('starting a run…');
+          key('space', true); setTimeout(function () { key('space', false); }, 150);
+        }
+      }, 1000);
+
+      function play() {
+        var P = window.isaacPortable; if (P && P.pauseStore) P.pauseStore(true);
+        var move = ['w', 'd', 's', 'a'], shoot = ['right', 'down', 'left', 'up'], k = 0, held = [];
+        var input = setInterval(function () {
+          held.forEach(function (n) { key(n, false); });
+          held = [move[k % 4], shoot[k % 4]]; k++;
+          held.forEach(function (n) { key(n, true); });
+        }, 700);
+        say('warming up…');
+        setTimeout(function () {
+          say('measuring (30 s)…');
+          var times = [], lastF = window.isaacFrame || 0, f0 = lastF, k0 = ticks(), s0 = performance.now(), on = true;
+          (function f() { if (!on) return; var fr = window.isaacFrame || 0; if (fr !== lastF) { times.push(performance.now()); lastF = fr; } requestAnimationFrame(f); })();
+          setTimeout(function () {
+            on = false; clearInterval(input); held.forEach(function (n) { key(n, false); });
+            var dur = (performance.now() - s0) / 1000, iv = [];
+            for (var j = 1; j < times.length; j++) iv.push(times[j] - times[j - 1]);
+            iv.sort(function (a, b) { return a - b; });
+            var slow = iv.slice(-Math.max(1, Math.floor(iv.length / 100)));
+            var slowMean = slow.reduce(function (a, b) { return a + b; }, 0) / (slow.length || 1);
+            finish({ fps: ((window.isaacFrame || 0) - f0) / dur, tps: Math.max(0, ticks() - k0) / dur,
+              low1: slowMean ? 1000 / slowMean : 0, p95: iv.length ? iv[Math.floor(iv.length * 0.95)] : 0 });
+          }, MEASURE);
+        }, WARM);
+      }
+    }
   })();
 </script>
 <div id="fps" hidden></div>
@@ -1438,7 +1621,7 @@ function isaacRecipeDecode(src, vorbis) {
   window.__isaacCounter = 'https://abacus.jasoncameron.dev';
   window.__isaacCounterNs = 'xreamm1-the-browsing-of-isaac';
   (function () {
-    if (window.__isaacHold || !window.fetch) return;
+    if (window.__isaacHold || window.__isaacBench || !window.fetch) return;
     var base = window.__isaacCounter + '/hit/' + window.__isaacCounterNs + '/';
     function hit(key) { try { fetch(base + key, { mode: 'cors', keepalive: true }).catch(function () {}); } catch (e) {} }
     hit('visits');
